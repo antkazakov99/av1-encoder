@@ -4,11 +4,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod encode;
+mod theme;
 mod tools;
 mod tracks;
 mod util;
 
-use eframe::egui;
+use eframe::egui::{self, RichText, Stroke};
 use encode::{Level, RunState, Settings};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -95,7 +96,7 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        setup_fonts(&cc.egui_ctx);
+        theme::apply(&cc.egui_ctx);
         let mut app = Self {
             saved: Saved::load(),
             locating: None,
@@ -263,23 +264,25 @@ impl App {
         suggested(&plan.output, &self.title, self.test_run)
     }
 
+    // Узкая строка вверху: состояние ffmpeg, NVEncC и mkvmerge.
     fn tools_bar(&mut self, ui: &mut egui::Ui) {
-        let red = egui::Color32::from_rgb(220, 80, 80);
-        let yellow = egui::Color32::from_rgb(210, 170, 60);
+        let p = theme::palette(ui);
         ui.horizontal(|ui| {
             if self.locating.is_some() {
                 let st = self.setup_status.lock().unwrap();
                 match st.progress {
-                    Some(p) => {
-                        ui.add(egui::ProgressBar::new(p).desired_width(220.0).show_percentage());
+                    Some(v) => {
+                        ui.add(egui::ProgressBar::new(v).desired_width(180.0).desired_height(6.0).fill(p.accent));
                     }
                     None => {
-                        ui.spinner();
+                        ui.add(egui::Spinner::new().size(14.0));
                     }
                 }
-                ui.label(if st.text.is_empty() { "Проверяю ffmpeg, NVEncC, mkvmerge…" } else { &st.text });
+                let text: &str = if st.text.is_empty() { "Проверяю ffmpeg, NVEncC, mkvmerge…" } else { &st.text };
+                ui.label(theme::weak(ui, text).small());
             } else if let Some(loc) = &self.located {
                 ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
                     if let Some(t) = loc.tools() {
                         let hint = format!(
                             "ffmpeg: {}{}\nNVEncC: {}\nmkvmerge: {}",
@@ -288,65 +291,253 @@ impl App {
                             t.nvencc.display(),
                             t.mkvmerge.display()
                         );
-                        ui.label(egui::RichText::new("✔ ffmpeg, NVEncC, mkvmerge готовы").color(egui::Color32::from_rgb(90, 170, 90))).on_hover_text(hint);
+                        ui.horizontal(|ui| {
+                            theme::dot(ui, p.good);
+                            ui.label(theme::weak(ui, "ffmpeg, NVEncC и mkvmerge готовы").small()).on_hover_text(hint);
+                        });
                     }
                     for n in &loc.notes {
-                        ui.colored_label(yellow, n);
+                        ui.label(RichText::new(n).color(p.warn).small());
                     }
-                    for p in &loc.problems {
-                        ui.colored_label(red, p);
+                    for problem in &loc.problems {
+                        ui.label(RichText::new(problem).color(p.bad));
                     }
                 });
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let hint = format!("Скачать последние версии заново в {}", tools::app_tools_dir().display());
-                if ui.add_enabled(self.locating.is_none() && !self.running(), egui::Button::new("Обновить инструменты")).on_hover_text(hint).clicked() {
+                let button = egui::Button::new(theme::weak(ui, "Обновить инструменты").small()).frame_when_inactive(false);
+                if ui.add_enabled(self.locating.is_none() && !self.running(), button).on_hover_text(hint).clicked() {
                     self.setup(true);
                 }
             });
         });
     }
 
-    fn run_view(&mut self, ui: &mut egui::Ui) {
-        let Some(run) = &self.run else { return };
-        let st = run.state.lock().unwrap();
-        ui.add_space(4.0);
-        ui.label(egui::RichText::new(&st.stage).strong().size(16.0));
-        ui.add_space(4.0);
-        match (&st.finished, st.progress) {
-            (Some(Ok(())), _) => {
-                ui.colored_label(egui::Color32::from_rgb(90, 170, 90), format!("Готово: {}", run.output.display()));
+    // Нижняя панель: настройки качества и главная кнопка; во время кодирования — «Остановить».
+    fn actions_bar(&mut self, ui: &mut egui::Ui, running: bool) {
+        let side_button = |text: &str| egui::Button::new(text.to_string()).min_size(egui::vec2(150.0, 36.0)).corner_radius(egui::CornerRadius::same(8));
+        ui.horizontal(|ui| {
+            if self.run.is_some() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if running {
+                        let stopping = self.run.as_ref().is_some_and(|r| r.cancel.load(Ordering::Relaxed));
+                        if ui.add_enabled(!stopping, side_button(if stopping { "Останавливаю…" } else { "Остановить" })).clicked() {
+                            if let Some(r) = &self.run {
+                                r.cancel.store(true, Ordering::Relaxed);
+                            }
+                        }
+                        ui.label(theme::weak(ui, "Готовые куски сохраняются: следующий запуск продолжит с них.").small());
+                    } else if ui.add(side_button("←  К дорожкам")).clicked() {
+                        self.run = None;
+                    }
+                });
+                return;
             }
-            (Some(Err(e)), _) => {
-                let text = if e == util::CANCELLED { "Остановлено.".to_string() } else { format!("Ошибка: {e}") };
-                ui.colored_label(egui::Color32::from_rgb(220, 80, 80), text);
+            ui.label(theme::weak(ui, "VMAF"));
+            ui.add(egui::DragValue::new(&mut self.saved.target_vmaf).range(80.0..=99.0).speed(0.1).fixed_decimals(1))
+                .on_hover_text("Средний VMAF каждого куска — не ниже этого значения");
+            ui.label(theme::weak(ui, "худший 1%"));
+            ui.add(egui::DragValue::new(&mut self.saved.floor_vmaf).range(60.0..=99.0).speed(0.1).fixed_decimals(1))
+                .on_hover_text("1% худших кадров каждого куска — не ниже этого значения");
+            ui.add_space(6.0);
+            ui.separator();
+            ui.add_space(6.0);
+            let before = self.suggested_output();
+            ui.checkbox(&mut self.test_run, "Пробный прогон").on_hover_text("Кодируется только начало фильма, в отдельный файл");
+            ui.add_enabled(self.test_run, egui::DragValue::new(&mut self.test_seconds).range(10..=3600).suffix(" с"));
+            if before.as_deref() == Some(self.output.as_str()) {
+                if let Some(next) = self.suggested_output() {
+                    self.output = next;
+                }
             }
-            (None, Some(p)) => {
-                ui.add(egui::ProgressBar::new(p).show_percentage().text(format!("{:.0}%  {}", p * 100.0, st.detail)));
-            }
-            (None, None) => {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let ready = self.plan.is_some() && self.loading.is_none() && self.tools().is_some();
+                if theme::primary_button(ui, ready, "Кодировать").clicked() {
+                    self.encode();
+                }
+            });
+        });
+    }
+
+    // Экран подготовки: фильм, дорожки, добавление файлов.
+    fn setup_view(&mut self, ui: &mut egui::Ui) {
+        let p = theme::palette(ui);
+        let view_height = ui.available_height();
+        let mut open: Option<PathBuf> = None;
+        let mut add: Option<Vec<PathBuf>> = None;
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 12.0;
+            let top = ui.cursor().top();
+            theme::card(ui).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                egui::Grid::new("movie").num_columns(2).spacing([14.0, 8.0]).show(ui, |ui| {
+                    ui.label(theme::weak(ui, "Исходник"));
+                    ui.horizontal(|ui| {
+                        let width = (ui.available_width() - SIDE_BUTTON - 8.0).max(200.0);
+                        let field = text_field(&mut self.source).hint_text("Путь к видео");
+                        let response = ui.add_sized([width, FIELD_HEIGHT], field);
+                        if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !self.source.trim().is_empty() {
+                            open = Some(PathBuf::from(self.source.trim().trim_matches('"')));
+                        }
+                        if ui.add_sized([SIDE_BUTTON, FIELD_HEIGHT], egui::Button::new("Выбрать…")).clicked() {
+                            if let Some(path) = pick_video(&self.source) {
+                                open = Some(path);
+                            }
+                        }
+                    });
+                    ui.end_row();
+                    let Some(plan) = &mut self.plan else { return };
+
+                    ui.label(theme::weak(ui, "Название"));
+                    let before = suggested(&plan.output, &self.title, self.test_run);
+                    let width = ui.available_width().min(460.0);
+                    ui.add_sized([width, FIELD_HEIGHT], text_field(&mut self.title).hint_text("Название (год)"));
+                    // Имя итогового файла следует за названием, пока его не правили вручную.
+                    if before.as_deref() == Some(self.output.as_str()) {
+                        if let Some(next) = suggested(&plan.output, &self.title, self.test_run) {
+                            self.output = next;
+                        }
+                    }
+                    ui.end_row();
+
+                    ui.label(theme::weak(ui, "Итоговый файл"));
+                    ui.horizontal(|ui| {
+                        let width = (ui.available_width() - SIDE_BUTTON - 8.0).max(200.0);
+                        ui.add_sized([width, FIELD_HEIGHT], text_field(&mut self.output));
+                        if ui.add_sized([SIDE_BUTTON, FIELD_HEIGHT], egui::Button::new("Изменить…")).clicked() {
+                            let current = Path::new(&self.output);
+                            let mut dialog = rfd::FileDialog::new().add_filter("Matroska", &["mkv"]);
+                            if let Some(dir) = current.parent().filter(|d| d.is_dir()) {
+                                dialog = dialog.set_directory(dir);
+                            }
+                            if let Some(name) = current.file_name() {
+                                dialog = dialog.set_file_name(name.to_string_lossy());
+                            }
+                            if let Some(path) = dialog.save_file() {
+                                self.output = path.display().to_string();
+                            }
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.label(theme::weak(ui, "Язык оригинала"));
+                    ui.horizontal(|ui| {
+                        ui.add_sized([COL_LANG, FIELD_HEIGHT], text_field(&mut plan.original_language));
+                        let name = tracks::lang_name(&tracks::lang_code(&plan.original_language));
+                        ui.label(theme::weak(ui, format!("{name} — {}", plan.original_source)));
+                    });
+                    ui.end_row();
+                });
+            });
+
+            if self.loading.is_some() || self.pending_open.is_some() {
                 ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(&st.detail);
+                    ui.add(egui::Spinner::new().size(16.0));
+                    let text = if self.pending_open.is_some() { "Файл откроется, когда будут готовы инструменты…" } else { "Читаю дорожки…" };
+                    ui.label(theme::weak(ui, text));
                 });
             }
-        }
-        ui.add_space(6.0);
-        egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
-            for (level, line) in &st.log {
-                let color = match level {
-                    Level::Step => egui::Color32::from_rgb(80, 180, 220),
-                    Level::Good => egui::Color32::from_rgb(90, 170, 90),
-                    Level::Warn => egui::Color32::from_rgb(210, 170, 60),
-                    Level::Bad => egui::Color32::from_rgb(220, 80, 80),
-                    Level::Info => ui.visuals().text_color(),
-                };
-                let text = egui::RichText::new(line).color(color).monospace();
-                if *level == Level::Step {
-                    ui.add_space(4.0);
-                }
-                ui.label(text);
+            if !self.error.is_empty() {
+                theme::banner(ui, p.bad, &self.error);
             }
+
+            if let Some(plan) = &mut self.plan {
+                for (kind, heading) in [(Kind::Audio, "Звук"), (Kind::Subtitle, "Субтитры")] {
+                    theme::card(ui).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        track_table(ui, &mut plan.tracks, kind, heading);
+                    });
+                }
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(self.adding.is_none(), egui::Button::new("+  Добавить дорожки…")).clicked() {
+                        let all: Vec<&str> = TRACK_EXTENSIONS.iter().chain(VIDEO_EXTENSIONS).copied().collect();
+                        let mut dialog = rfd::FileDialog::new().add_filter("Звук и субтитры", &all);
+                        if let Some(dir) = plan.source.parent().filter(|d| d.is_dir()) {
+                            dialog = dialog.set_directory(dir);
+                        }
+                        add = dialog.pick_files();
+                    }
+                    if self.adding.is_some() {
+                        ui.add(egui::Spinner::new().size(16.0));
+                        ui.label(theme::weak(ui, "Читаю файл…"));
+                    } else {
+                        ui.label(theme::weak(ui, "Звук или субтитры из других файлов. Их можно и перетащить в окно.").small());
+                    }
+                });
+            } else if self.loading.is_none() && self.pending_open.is_none() {
+                let height = (view_height - (ui.cursor().top() - top) - 4.0).max(220.0);
+                if let Some(path) = drop_zone(ui, height, &self.source) {
+                    open = Some(path);
+                }
+            }
+        });
+        if let Some(path) = open {
+            self.open(path);
+        }
+        if let Some(paths) = add {
+            self.add_files(paths);
+        }
+    }
+
+    // Экран кодирования: этап, ход, журнал.
+    fn run_view(&mut self, ui: &mut egui::Ui) {
+        let p = theme::palette(ui);
+        let Some(run) = &self.run else { return };
+        let st = run.state.lock().unwrap();
+        ui.spacing_mut().item_spacing.y = 12.0;
+        theme::card(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 8.0;
+            let stage: &str = if st.stage.is_empty() { "Подготовка…" } else { &st.stage };
+            ui.label(theme::semibold(stage, 18.0));
+            match (&st.finished, st.progress) {
+                (Some(Ok(())), _) => {
+                    ui.horizontal(|ui| {
+                        theme::dot(ui, p.good);
+                        ui.label(RichText::new(run.output.display().to_string()).color(p.good));
+                        if ui.button("Показать в папке").clicked() {
+                            show_in_folder(&run.output);
+                        }
+                    });
+                }
+                (Some(Err(e)), _) => {
+                    let text = if e == util::CANCELLED { "Остановлено. Готовые куски сохранены.".to_string() } else { format!("Ошибка: {e}") };
+                    theme::banner(ui, if e == util::CANCELLED { p.warn } else { p.bad }, &text);
+                }
+                (None, Some(v)) => {
+                    ui.add(egui::ProgressBar::new(v).desired_height(8.0).fill(p.accent).corner_radius(egui::CornerRadius::same(4)));
+                    ui.horizontal(|ui| {
+                        ui.label(theme::semibold(format!("{:.0}%", v * 100.0), 14.0));
+                        ui.label(theme::weak(ui, st.detail.as_str()));
+                    });
+                }
+                (None, None) => {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(16.0));
+                        ui.label(theme::weak(ui, st.detail.as_str()));
+                    });
+                }
+            }
+        });
+        theme::card(ui).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 3.0;
+                for (level, line) in &st.log {
+                    let color = match level {
+                        Level::Step => p.accent,
+                        Level::Good => p.good,
+                        Level::Warn => p.warn,
+                        Level::Bad => p.bad,
+                        Level::Info => p.text,
+                    };
+                    if *level == Level::Step {
+                        ui.add_space(6.0);
+                    }
+                    ui.label(RichText::new(line).color(color).monospace());
+                }
+            });
         });
     }
 }
@@ -369,8 +560,9 @@ impl eframe::App for App {
             self.confirm_close = true;
         }
         if self.confirm_close {
-            egui::Window::new("Закрыть?").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(&ctx, |ui| {
+            egui::Window::new("Закрыть приложение?").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0]).show(&ctx, |ui| {
                 ui.label("Кодирование ещё идёт. Готовые куски сохранятся, следующий запуск продолжит с них.");
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if ui.button("Остановить и закрыть").clicked() {
                         if let Some(r) = &self.run {
@@ -387,7 +579,8 @@ impl eframe::App for App {
         }
 
         // Файл можно просто перетащить в окно: видео открывается, звук и субтитры добавляются к открытому фильму.
-        if !running && self.run.is_none() {
+        let idle = !running && self.run.is_none();
+        if idle {
             let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
             if self.plan.is_some() && !dropped.is_empty() && dropped.iter().all(|p| is_track_file(p)) {
                 self.add_files(dropped);
@@ -396,160 +589,88 @@ impl eframe::App for App {
             }
         }
 
-        egui::Panel::top("tools").show(ui, |ui| {
-            ui.add_space(4.0);
-            self.tools_bar(ui);
-            ui.add_space(4.0);
-        });
-
-        egui::Panel::bottom("actions").show(ui, |ui| {
-            ui.add_space(6.0);
-            if self.run.is_some() {
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if running {
-                            let stopping = self.run.as_ref().is_some_and(|r| r.cancel.load(Ordering::Relaxed));
-                            let button = egui::Button::new(egui::RichText::new(if stopping { "Останавливаю…" } else { "Остановить" }).size(16.0)).min_size(egui::vec2(140.0, 32.0));
-                            if ui.add_enabled(!stopping, button).on_hover_text("Готовые куски сохранятся: следующий запуск продолжит с них").clicked() {
-                                if let Some(r) = &self.run {
-                                    r.cancel.store(true, Ordering::Relaxed);
-                                }
-                            }
-                        } else if ui.add(egui::Button::new(egui::RichText::new("К дорожкам").size(16.0)).min_size(egui::vec2(140.0, 32.0))).clicked() {
-                            self.run = None;
-                        }
-                    });
-                });
-            } else {
-                ui.horizontal(|ui| {
-                    ui.label("VMAF: среднее");
-                    ui.add(egui::DragValue::new(&mut self.saved.target_vmaf).range(80.0..=99.0).speed(0.1));
-                    ui.label("1% худших");
-                    ui.add(egui::DragValue::new(&mut self.saved.floor_vmaf).range(60.0..=99.0).speed(0.1));
-                    ui.separator();
-                    let before = self.suggested_output();
-                    ui.checkbox(&mut self.test_run, "Пробный прогон, секунд:");
-                    ui.add_enabled(self.test_run, egui::DragValue::new(&mut self.test_seconds).range(10..=3600));
-                    if before.as_deref() == Some(self.output.as_str()) {
-                        if let Some(next) = self.suggested_output() {
-                            self.output = next;
-                        }
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let ready = self.plan.is_some() && self.loading.is_none() && self.tools().is_some();
-                        let button = egui::Button::new(egui::RichText::new("Кодировать").strong().size(16.0)).min_size(egui::vec2(140.0, 32.0));
-                        if ui.add_enabled(ready, button).clicked() {
-                            self.encode();
-                        }
-                    });
-                });
-            }
-            ui.add_space(6.0);
-        });
-
-        egui::CentralPanel::default().show(ui, |ui| {
-            if self.run.is_some() {
-                self.run_view(ui);
-                return;
-            }
-            ui.horizontal(|ui| {
-                ui.label("Файл:");
-                let field = egui::TextEdit::singleline(&mut self.source).desired_width(ui.available_width() - 110.0).hint_text("Перетащите видео в окно или нажмите «Выбрать…»");
-                let response = ui.add(field);
-                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !self.source.trim().is_empty() {
-                    self.open(PathBuf::from(self.source.trim().trim_matches('"')));
-                }
-                if ui.button("Выбрать…").clicked() {
-                    let mut dialog = rfd::FileDialog::new().add_filter("Видео", VIDEO_EXTENSIONS);
-                    if let Some(dir) = Path::new(&self.source).parent().filter(|d| d.is_dir()) {
-                        dialog = dialog.set_directory(dir);
-                    }
-                    if let Some(path) = dialog.pick_file() {
-                        self.open(path);
-                    }
+        let p = theme::palette(ui);
+        let bar = |fill: egui::Color32, y: i8| egui::Frame::new().fill(fill).inner_margin(egui::Margin::symmetric(16, y));
+        egui::Panel::top("tools").frame(bar(p.background, 8)).show_separator_line(false).show(ui, |ui| self.tools_bar(ui));
+        egui::Panel::bottom("actions").frame(bar(p.card, 12)).show(ui, |ui| self.actions_bar(ui, running));
+        let margin = egui::Margin { left: 16, right: 16, top: 2, bottom: 14 };
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(p.background).inner_margin(margin)).show(ui, |ui| {
+            // В широком окне содержимое не растягивается на всю ширину, а стоит по центру.
+            let available = ui.available_rect_before_wrap();
+            let rect = egui::Rect::from_center_size(available.center(), egui::vec2(available.width().min(CONTENT_WIDTH), available.height()));
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                if self.run.is_some() {
+                    self.run_view(ui);
+                } else {
+                    self.setup_view(ui);
                 }
             });
-
-            if self.loading.is_some() || self.pending_open.is_some() {
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(if self.pending_open.is_some() { "Файл откроется, когда будут готовы инструменты…" } else { "Читаю дорожки…" });
-                });
-            }
-            if !self.error.is_empty() {
-                ui.add_space(8.0);
-                ui.colored_label(egui::Color32::from_rgb(220, 80, 80), &self.error);
-            }
-            let Some(plan) = &mut self.plan else { return };
-
-            ui.add_space(8.0);
-            egui::Grid::new("movie").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
-                ui.label("Название:");
-                let before = suggested(&plan.output, &self.title, self.test_run);
-                ui.add(egui::TextEdit::singleline(&mut self.title).desired_width(420.0).hint_text("Название (год)"));
-                // Имя итогового файла следует за названием, пока его не правили вручную.
-                if before.as_deref() == Some(self.output.as_str()) {
-                    if let Some(next) = suggested(&plan.output, &self.title, self.test_run) {
-                        self.output = next;
-                    }
-                }
-                ui.end_row();
-                ui.label("Итоговый файл:");
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.output).desired_width(ui.available_width() - 110.0));
-                    if ui.button("Изменить…").clicked() {
-                        let current = Path::new(&self.output);
-                        let mut dialog = rfd::FileDialog::new().add_filter("Matroska", &["mkv"]);
-                        if let Some(dir) = current.parent().filter(|d| d.is_dir()) {
-                            dialog = dialog.set_directory(dir);
-                        }
-                        if let Some(name) = current.file_name() {
-                            dialog = dialog.set_file_name(name.to_string_lossy());
-                        }
-                        if let Some(path) = dialog.save_file() {
-                            self.output = path.display().to_string();
-                        }
-                    }
-                });
-                ui.end_row();
-                ui.label("Язык оригинала:");
-                ui.horizontal(|ui| {
-                    ui.add_sized([40.0, 22.0], egui::TextEdit::singleline(&mut plan.original_language));
-                    ui.label(egui::RichText::new(format!("{} — {}", tracks::lang_name(&tracks::lang_code(&plan.original_language)), plan.original_source)).weak());
-                });
-                ui.end_row();
-            });
-
-            ui.add_space(4.0);
-            let source_dir = plan.source.parent().map(Path::to_path_buf);
-            let mut add: Option<Vec<PathBuf>> = None;
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                track_table(ui, &mut plan.tracks, Kind::Audio, "Звук");
-                ui.add_space(12.0);
-                track_table(ui, &mut plan.tracks, Kind::Subtitle, "Субтитры");
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    let button = egui::Button::new("Добавить дорожки…");
-                    if ui.add_enabled(self.adding.is_none(), button).on_hover_text("Звук или субтитры из других файлов. Такие файлы можно и перетащить в окно.").clicked() {
-                        let all: Vec<&str> = TRACK_EXTENSIONS.iter().chain(VIDEO_EXTENSIONS).copied().collect();
-                        let mut dialog = rfd::FileDialog::new().add_filter("Звук и субтитры", &all);
-                        if let Some(dir) = source_dir.as_deref().filter(|d| d.is_dir()) {
-                            dialog = dialog.set_directory(dir);
-                        }
-                        add = dialog.pick_files();
-                    }
-                    if self.adding.is_some() {
-                        ui.spinner();
-                        ui.label("Читаю файл…");
-                    }
-                });
-            });
-            if let Some(paths) = add {
-                self.add_files(paths);
-            }
         });
+
+        // Файл над окном: видно, что его можно отпустить.
+        let hovered: Vec<Option<PathBuf>> = ctx.input(|i| i.raw.hovered_files.iter().map(|f| f.path.clone()).collect());
+        if idle && !hovered.is_empty() {
+            let tracks = self.plan.is_some() && hovered.iter().all(|f| f.as_deref().is_some_and(is_track_file));
+            let text = if tracks { "Отпустите, чтобы добавить дорожки" } else { "Отпустите, чтобы открыть видео" };
+            let rect = ctx.content_rect();
+            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("drop-overlay")));
+            painter.rect_filled(rect, egui::CornerRadius::ZERO, p.background.gamma_multiply(0.9));
+            painter.rect_stroke(rect.shrink(14.0), egui::CornerRadius::same(12), Stroke::new(2.0, p.accent), egui::StrokeKind::Inside);
+            painter.text(rect.center(), egui::Align2::CENTER_CENTER, text, egui::FontId::proportional(20.0), p.accent);
+        }
     }
+}
+
+const CONTENT_WIDTH: f32 = 1440.0;
+const FIELD_HEIGHT: f32 = 28.0;
+const SIDE_BUTTON: f32 = 110.0;
+// Таблицы дорожек: ширина столбцов одна у звука и у субтитров, название и источник делят остаток.
+const ROW_HEIGHT: f32 = 36.0;
+const GAP: f32 = 10.0;
+const COL_HANDLE: f32 = 18.0;
+const COL_KEEP: f32 = 28.0;
+const COL_LANG: f32 = 48.0;
+const COL_FORMAT: f32 = 160.0;
+const COL_FLAGS: f32 = 222.0;
+const COL_DEFAULT: f32 = 74.0;
+
+// Поле ввода: текст по центру высоты, как у соседних надписей.
+fn text_field(text: &mut String) -> egui::TextEdit<'_> {
+    egui::TextEdit::singleline(text).align(egui::Align2::LEFT_CENTER)
+}
+
+fn pick_video(current: &str) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new().add_filter("Видео", VIDEO_EXTENSIONS);
+    if let Some(dir) = Path::new(current).parent().filter(|d| d.is_dir()) {
+        dialog = dialog.set_directory(dir);
+    }
+    dialog.pick_file()
+}
+
+// Проводник с выделенным файлом.
+fn show_in_folder(path: &Path) {
+    use std::os::windows::process::CommandExt;
+    let _ = std::process::Command::new("explorer.exe").raw_arg(format!("/select,\"{}\"", path.display())).spawn();
+}
+
+// Пустой экран: приглашение перетащить или выбрать видео.
+fn drop_zone(ui: &mut egui::Ui, height: f32, current: &str) -> Option<PathBuf> {
+    let mut picked = None;
+    let p = theme::palette(ui);
+    egui::Frame::new().fill(p.card).stroke(Stroke::new(1.0, p.border)).corner_radius(egui::CornerRadius::same(12)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.set_height(height);
+        ui.vertical_centered(|ui| {
+            ui.add_space(((height - 130.0) / 2.0).max(0.0));
+            ui.label(theme::semibold("Перетащите видео в окно", 20.0));
+            ui.label(theme::weak(ui, "Видео перекодируется в AV1 на видеокарте с контролем качества по VMAF, звук — в Opus."));
+            ui.add_space(6.0);
+            if theme::primary_button(ui, true, "Выбрать файл…").clicked() {
+                picked = pick_video(current);
+            }
+        });
+    });
+    picked
 }
 
 // Флаги дорожки в MKV и подсказки к ним: у звука и у субтитров свои.
@@ -564,96 +685,192 @@ fn flags_of(kind: Kind) -> &'static [(&'static str, &'static str)] {
     }
 }
 
-// Таблица дорожек одного вида: оставить, порядок, язык, название, флаги, по умолчанию.
+// Привычные названия форматов вместо имён кодеков ffmpeg.
+fn codec_name(codec: &str) -> String {
+    let name = match codec {
+        "dts" => "DTS",
+        "ac3" => "AC3",
+        "eac3" => "E-AC3",
+        "truehd" => "TrueHD",
+        "mlp" => "MLP",
+        "flac" => "FLAC",
+        "alac" => "ALAC",
+        "aac" => "AAC",
+        "opus" => "Opus",
+        "vorbis" => "Vorbis",
+        "mp3" => "MP3",
+        "mp2" => "MP2",
+        "subrip" => "SRT",
+        "ass" | "ssa" => "ASS",
+        "hdmv_pgs_subtitle" => "PGS",
+        "dvd_subtitle" => "VobSub",
+        "dvb_subtitle" => "DVB",
+        "webvtt" => "VTT",
+        "mov_text" => "TX3G",
+        c if c.starts_with("pcm_") => "PCM",
+        c => return c.to_string(),
+    };
+    name.to_string()
+}
+
+// Что было и что будет: «DTS 5.1 → Opus 384».
+fn format_text(t: &Track) -> String {
+    let codec = codec_name(&t.codec);
+    if t.kind == Kind::Subtitle {
+        return codec;
+    }
+    let layout = match t.layout.as_str() {
+        "" => format!("{}ch", t.channels),
+        "mono" => "1.0".to_string(),
+        "stereo" => "2.0".to_string(),
+        l => l.split('(').next().unwrap_or(l).to_string(),
+    };
+    if t.copy { format!("{codec} {layout} → копия") } else { format!("{codec} {layout} → Opus {}", t.kbps) }
+}
+
+// Источник: название в исходнике и распознанный тип перевода; у добавленных — их файл.
+fn source_text(t: &Track) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(file) = &t.file {
+        parts.push(file.file_name().unwrap_or_default().to_string_lossy().to_string());
+    }
+    if !t.source_title.is_empty() {
+        parts.push(t.source_title.clone());
+    }
+    parts.extend(t.types.iter().filter(|ty| !tracks::MARKS.contains(&ty.as_str())).cloned());
+    parts.join("  ·  ")
+}
+
+// Ячейка строки таблицы: заданная ширина, содержимое по центру высоты.
+fn cell<R>(ui: &mut egui::Ui, width: f32, height: f32, enabled: bool, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.allocate_ui_with_layout(egui::vec2(width, height), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.set_width(width);
+        ui.set_min_height(height);
+        if !enabled {
+            ui.disable();
+        }
+        add(ui)
+    })
+    .inner
+}
+
+// Таблица дорожек одного вида: порядок, оставить, язык, формат, название, флаги, по умолчанию, источник.
 fn track_table(ui: &mut egui::Ui, tracks: &mut Vec<Track>, kind: Kind, heading: &str) {
-    ui.heading(heading);
+    let p = theme::palette(ui);
     let rows: Vec<usize> = (0..tracks.len()).filter(|&i| tracks[i].kind == kind).collect();
+    let kept = rows.iter().filter(|&&i| tracks[i].keep).count();
+    ui.horizontal(|ui| {
+        ui.label(theme::semibold(heading, 16.0));
+        let count = if rows.is_empty() { "нет".to_string() } else { format!("{kept} из {}", rows.len()) };
+        ui.label(theme::weak(ui, count));
+    });
     if rows.is_empty() {
-        ui.label("нет");
         return;
     }
     let id = if kind == Kind::Audio { "audio" } else { "subtitle" };
+    let x_range = ui.max_rect().x_range();
+    let fixed = COL_HANDLE + COL_KEEP + COL_LANG + COL_FORMAT + COL_FLAGS + COL_DEFAULT + 7.0 * GAP;
+    let flexible = (ui.available_width() - fixed).max(300.0);
+    let col_name = (flexible * 0.45).clamp(170.0, 340.0);
+    let col_source = flexible - col_name;
+
     let mut make_default: Option<usize> = None;
     let mut remove: Option<usize> = None;
     // Вертикальные границы строк: по ним видно, на какую строку бросили перетаскиваемую.
     let mut spans: Vec<(f32, f32)> = Vec::with_capacity(rows.len());
-    let grid = egui::Grid::new(id).striped(true).num_columns(8).spacing([12.0, 4.0]).show(ui, |ui| {
-        for title in ["", "", "Язык", "Формат", "Название", "Флаги", "По умолч.", "Источник"] {
-            ui.label(egui::RichText::new(title).weak());
-        }
-        ui.end_row();
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(GAP, 0.0);
+        ui.horizontal(|ui| {
+            let titles = [
+                ("", COL_HANDLE),
+                ("", COL_KEEP),
+                ("Язык", COL_LANG),
+                ("Формат", COL_FORMAT),
+                ("Название", col_name),
+                ("Флаги", COL_FLAGS),
+                ("По умолч.", COL_DEFAULT),
+                ("Источник", col_source),
+            ];
+            for (title, width) in titles {
+                cell(ui, width, 26.0, true, |ui| {
+                    ui.label(theme::weak(ui, title).small());
+                });
+            }
+        });
         for (pos, &i) in rows.iter().enumerate() {
             let t = &mut tracks[i];
-            let handle = ui
-                .dnd_drag_source(ui.scope_id().with((id, "row", &t.file, t.index)), DragRow { kind, pos }, |ui| {
-                    ui.label(egui::RichText::new("≡").size(18.0).weak());
-                })
-                .response
-                .on_hover_text("Перетащите, чтобы изменить порядок")
-                .on_hover_cursor(egui::CursorIcon::Grab);
-            spans.push((handle.rect.top() - 4.0, handle.rect.bottom() + 4.0));
-            ui.checkbox(&mut t.keep, "").on_hover_text("Оставить дорожку");
-            // Название следует за языком и флагами, пока его не правили вручную.
-            let auto_name = t.auto_name();
-            ui.add_enabled_ui(t.keep, |ui| ui.add_sized([40.0, 22.0], egui::TextEdit::singleline(&mut t.language)));
-            let format = if kind == Kind::Audio {
-                let layout = if t.layout.is_empty() { format!("{}ch", t.channels) } else { t.layout.clone() };
-                if t.copy { format!("{} {} → копия", t.codec, layout) } else { format!("{} {} → Opus {}", t.codec, layout, t.kbps) }
-            } else {
-                t.codec.clone()
-            };
-            ui.label(format);
-            ui.add_enabled_ui(t.keep, |ui| ui.add_sized([300.0, 22.0], egui::TextEdit::singleline(&mut t.name)));
-            let named_auto = t.name == auto_name;
-            ui.add_enabled_ui(t.keep, |ui| {
-                ui.horizontal(|ui| {
+            let keep = t.keep;
+            let row = ui.horizontal(|ui| {
+                cell(ui, COL_HANDLE, ROW_HEIGHT, true, |ui| {
+                    ui.dnd_drag_source(egui::Id::unique((id, "row", &t.file, t.index)), DragRow { kind, pos }, |ui| {
+                        ui.label(RichText::new("≡").size(18.0).color(p.weak));
+                    })
+                    .response
+                    .on_hover_text("Перетащите, чтобы изменить порядок")
+                    .on_hover_cursor(egui::CursorIcon::Grab);
+                });
+                cell(ui, COL_KEEP, ROW_HEIGHT, true, |ui| {
+                    ui.add(egui::Checkbox::without_text(&mut t.keep)).on_hover_text("Оставить дорожку");
+                });
+                // Название следует за языком и флагами, пока его не правили вручную.
+                let auto_name = t.auto_name();
+                cell(ui, COL_LANG, ROW_HEIGHT, keep, |ui| {
+                    ui.add_sized([COL_LANG, FIELD_HEIGHT], text_field(&mut t.language));
+                });
+                cell(ui, COL_FORMAT, ROW_HEIGHT, keep, |ui| {
+                    ui.add(egui::Label::new(format_text(t)).truncate()).on_hover_text("Битрейт Opus — в кбит/с");
+                });
+                cell(ui, col_name, ROW_HEIGHT, keep, |ui| {
+                    ui.add_sized([col_name, FIELD_HEIGHT], text_field(&mut t.name));
+                });
+                let named_auto = t.name == auto_name;
+                cell(ui, COL_FLAGS, ROW_HEIGHT, keep, |ui| {
                     ui.spacing_mut().item_spacing.x = 4.0;
                     for &(flag, hint) in flags_of(kind) {
                         let on = t.has(flag);
-                        if ui.add(egui::Button::new(flag).selected(on)).on_hover_text(hint).clicked() {
+                        if theme::chip(ui, on, flag).on_hover_text(hint).clicked() {
                             t.set(flag, !on);
                         }
                     }
                 });
-            });
-            if named_auto {
-                t.name = t.auto_name();
-            }
-            let mut is_default = t.default;
-            if ui.add_enabled(t.keep, egui::Checkbox::new(&mut is_default, "")).on_hover_text("Дорожка по умолчанию: одна или ни одной").changed() {
-                make_default = Some(i);
-            }
-            // Источник: название в исходнике и распознанный тип перевода; у добавленных — их файл.
-            let mut source: Vec<String> = Vec::new();
-            if let Some(file) = &t.file {
-                source.push(file.file_name().unwrap_or_default().to_string_lossy().to_string());
-            }
-            if !t.source_title.is_empty() {
-                source.push(t.source_title.clone());
-            }
-            source.extend(t.types.iter().filter(|ty| !tracks::MARKS.contains(&ty.as_str())).cloned());
-            ui.horizontal(|ui| {
-                if let Some(file) = &t.file {
-                    if ui.small_button("×").on_hover_text(format!("Убрать добавленную дорожку\n{}", file.display())).clicked() {
-                        remove = Some(i);
-                    }
+                if named_auto {
+                    t.name = t.auto_name();
                 }
-                ui.label(egui::RichText::new(source.join("  · ")).weak());
+                cell(ui, COL_DEFAULT, ROW_HEIGHT, keep, |ui| {
+                    let mut is_default = t.default;
+                    if ui.add(egui::Checkbox::without_text(&mut is_default)).on_hover_text("Дорожка по умолчанию: одна или ни одной").changed() {
+                        make_default = Some(i);
+                    }
+                });
+                cell(ui, col_source, ROW_HEIGHT, true, |ui| {
+                    if let Some(file) = &t.file {
+                        if ui.small_button("×").on_hover_text(format!("Убрать добавленную дорожку\n{}", file.display())).clicked() {
+                            remove = Some(i);
+                        }
+                    }
+                    let color = if keep { p.weak } else { p.weak.gamma_multiply(0.55) };
+                    ui.add(egui::Label::new(RichText::new(source_text(t)).color(color)).truncate());
+                });
             });
-            ui.end_row();
+            let rect = row.response.rect;
+            spans.push((rect.top(), rect.bottom()));
+            if pos + 1 < rows.len() {
+                ui.painter().hline(x_range, rect.bottom(), Stroke::new(1.0, p.border));
+            }
         }
     });
+
     // Перетаскивание строки внутри своей таблицы; кодирование берёт этот порядок.
     let ctx = ui.ctx().clone();
     if let (Some(drag), Some(pointer)) = (egui::DragAndDrop::payload::<DragRow>(&ctx), ctx.pointer_interact_pos()) {
-        if drag.kind == kind && grid.response.rect.x_range().contains(pointer.x) {
+        if drag.kind == kind && x_range.contains(pointer.x) {
             let target = spans
                 .iter()
                 .position(|&(top, bottom)| pointer.y >= top && pointer.y < bottom)
                 .unwrap_or(if pointer.y < spans[0].0 { 0 } else { spans.len() - 1 });
             // Линия показывает, куда встанет строка.
-            let y = if target > drag.pos { spans[target].1 - 2.0 } else { spans[target].0 + 2.0 };
-            ui.painter().hline(grid.response.rect.x_range(), y, egui::Stroke::new(2.0, ui.visuals().selection.bg_fill));
+            let y = if target > drag.pos { spans[target].1 } else { spans[target].0 };
+            ui.painter().hline(x_range, y, Stroke::new(2.0, p.accent));
             if ui.input(|i| i.pointer.any_released()) {
                 egui::DragAndDrop::clear_payload(&ctx);
                 if target != drag.pos {
@@ -688,27 +905,9 @@ fn suggested(output: &Path, title: &str, test_run: bool) -> Option<String> {
     Some(dir.join(format!("{name}{suffix}")).display().to_string())
 }
 
-// Segoe UI из Windows: привычный вид и кириллица.
-fn setup_fonts(ctx: &egui::Context) {
-    let Ok(bytes) = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf") else { return };
-    let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert("segoe".into(), egui::FontData::from_owned(bytes).into());
-    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-        family.insert(0, "segoe".into());
-    }
-    // Журнал моноширинный: Consolas с кириллицей.
-    if let Ok(mono) = std::fs::read(r"C:\Windows\Fonts\consola.ttf") {
-        fonts.font_data.insert("consolas".into(), egui::FontData::from_owned(mono).into());
-        if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-            family.insert(0, "consolas".into());
-        }
-    }
-    ctx.set_fonts(fonts);
-}
-
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1150.0, 760.0]).with_min_inner_size([800.0, 480.0]).with_drag_and_drop(true),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1180.0, 780.0]).with_min_inner_size([940.0, 520.0]).with_drag_and_drop(true),
         ..Default::default()
     };
     eframe::run_native("AV1 — перекодирование", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
