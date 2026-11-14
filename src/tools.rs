@@ -15,6 +15,9 @@ pub struct Tools {
     pub mkvmerge: PathBuf,
     // scale_cuda: уменьшение кадра на видеокарте (поиск сцен, VMAF 4K в 1080p).
     pub scale_cuda: bool,
+    // SvtAv1EncApp с tune «Film Grain» (форк Tritium): кодирование на процессоре с сохранением зерна.
+    // Необязателен и не скачивается: берётся со своей папки или из StaxRip.
+    pub svt: Option<PathBuf>,
 }
 
 // Итог: найденное, предупреждения и что не так с остальным.
@@ -23,6 +26,7 @@ pub struct Located {
     pub ffmpeg: Option<(PathBuf, PathBuf, bool)>,
     pub nvencc: Option<PathBuf>,
     pub mkvmerge: Option<PathBuf>,
+    pub svt: Option<PathBuf>,
     pub notes: Vec<String>,
     pub problems: Vec<String>,
 }
@@ -30,7 +34,7 @@ pub struct Located {
 impl Located {
     pub fn tools(&self) -> Option<Tools> {
         let (ffmpeg, ffprobe, scale_cuda) = self.ffmpeg.clone()?;
-        Some(Tools { ffmpeg, ffprobe, nvencc: self.nvencc.clone()?, mkvmerge: self.mkvmerge.clone()?, scale_cuda })
+        Some(Tools { ffmpeg, ffprobe, nvencc: self.nvencc.clone()?, mkvmerge: self.mkvmerge.clone()?, scale_cuda, svt: self.svt.clone() })
     }
 }
 
@@ -203,6 +207,24 @@ fn find_tool(tool: Tool, roots: &[(PathBuf, bool)], loc: &mut Located) -> bool {
     }
 }
 
+// SvtAv1EncApp, у которого tune 5 — «Film Grain». В основной ветке SVT-AV1 этот номер занят VMAF,
+// поэтому годится только форк (Tritium). Порядок: своя папка, папка рядом с приложением, StaxRip, PATH.
+fn find_svt() -> Option<PathBuf> {
+    let mut roots = vec![(app_tools_dir(), true)];
+    if let Some(dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
+        roots.push((dir.join("tools"), true));
+    }
+    for staxrip in staxrip_dirs() {
+        roots.push((staxrip.join(r"Apps\Encoders\SvtAv1EncApp-Tritium"), false));
+        roots.push((staxrip.join(r"Apps\Encoders"), true));
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        roots.extend(std::env::split_paths(&path).map(|p| (p, false)));
+    }
+    let film_grain = |exe: &PathBuf| capture(&Cmd::new(exe).arg("--help")).is_ok_and(|(_, out, err)| out.contains("5 = Film Grain") || err.contains("5 = Film Grain"));
+    candidates(&roots, &["SvtAv1EncApp.exe"]).into_iter().find(film_grain)
+}
+
 // ---------------------------------------------------------------- скачивание
 
 struct Source {
@@ -357,6 +379,7 @@ pub fn setup(update: bool, status: Arc<Mutex<SetupStatus>>) -> Located {
             }
         }
     }
+    loc.svt = find_svt();
     *status.lock().unwrap() = SetupStatus::default();
     loc
 }
@@ -369,6 +392,7 @@ pub fn find_existing() -> Located {
     for tool in Tool::ALL {
         find_tool(tool, &all, &mut loc);
     }
+    loc.svt = find_svt();
     loc
 }
 

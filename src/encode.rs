@@ -1,4 +1,4 @@
-// Кодирование: звук в Opus, подбор базового Q на отрезках, куски по сменам сцен
+// Кодирование: звук в Opus, подбор базового Q (или CRF) на отрезках, куски по сменам сцен
 // с контролем VMAF, склейка и сборка MKV без лишних тегов.
 //
 // Промежуточные файлы лежат в "<итог>.work" и называются как у прежнего скрипта
@@ -14,8 +14,26 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+pub enum Codec {
+    // NVENC на видеокарте: быстро, Q подбирается по VMAF. Плёночное зерно не сохраняет.
+    Nvenc,
+    // SVT-AV1 (форк Tritium) на процессоре с tune «Film Grain»: зерно сохраняется. CRF подбирается по VMAF
+    // так же, как Q у NVENC. Зерна VMAF не видит: его бережёт сам tune и потолок CRF.
+    Svt,
+}
+
 #[derive(Clone)]
 pub struct Settings {
+    pub codec: Codec,
+    // SVT-AV1: границы CRF для подбора (больше — хуже и меньше). Выше потолка зерно грубеет
+    // и в тёмных сценах плывёт цвет, даже если VMAF ещё в норме.
+    pub svt_min_crf: i32,
+    pub svt_max_crf: i32,
+    pub svt_preset: i32,
+    pub svt_params: String,
+    // Два одновременных кодирования на 16 потоках дают около +10% к одному, третье почти ничего не добавляет.
+    pub svt_workers: usize,
     // Средний VMAF куска и порог провалов (1-й перцентиль по кадрам).
     pub target_vmaf: f64,
     pub floor_vmaf: f64,
@@ -46,6 +64,12 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            codec: Codec::Nvenc,
+            svt_min_crf: 20,
+            svt_max_crf: 40,
+            svt_preset: 6,
+            svt_params: "--tune 5".into(),
+            svt_workers: 2,
             target_vmaf: 95.0,
             floor_vmaf: 88.0,
             tolerance: 0.5,
@@ -66,6 +90,16 @@ impl Default for Settings {
             cpu_decode: false,
             native_vmaf: false,
         }
+    }
+}
+
+impl Settings {
+    // Границы подбора качества и как оно называется у выбранного кодировщика.
+    pub fn q_range(&self) -> (i32, i32) {
+        if self.codec == Codec::Svt { (self.svt_min_crf, self.svt_max_crf) } else { (self.min_q, self.max_q) }
+    }
+    pub fn q_name(&self) -> &'static str {
+        if self.codec == Codec::Svt { "CRF" } else { "Q" }
     }
 }
 
@@ -219,7 +253,7 @@ struct Encoder<'a> {
     fps_den: i64,
     fps: f64,
     seek_offset: f64,
-    nv_args: Vec<String>,
+    enc_args: Vec<String>,
     gpu: bool,
     download: String,
     vmaf_scaled: bool,
@@ -293,8 +327,10 @@ impl<'a> Encoder<'a> {
         if output == source {
             return Err("Итоговый файл совпадает с исходным.".into());
         }
-        if s.min_q > s.max_q {
-            return Err("MinQ больше MaxQ.".into());
+        let (min_q, max_q) = s.q_range();
+        let qn = s.q_name();
+        if min_q > max_q {
+            return Err(format!("Нижняя граница {qn} ({min_q}) больше верхней ({max_q})."));
         }
         let movie = job.title.split_whitespace().collect::<Vec<_>>().join(" ");
         let orig = plan.original_language.clone();
@@ -379,6 +415,11 @@ impl<'a> Encoder<'a> {
         }
 
         let (nv, hdr) = nvenc_args(tools, &source, &video, s, fps)?;
+        let svt = s.codec == Codec::Svt;
+        if svt && tools.svt.is_none() {
+            return Err("Не найден SvtAv1EncApp с tune «Film Grain» (форк Tritium): он берётся из StaxRip или из папки программ приложения.".into());
+        }
+        let nv = if svt { svt_args(&video, s, fps, hdr.as_ref()) } else { nv };
         let is_hdr = hdr.is_some();
         let hdr_mkv = hdr.as_ref().map(|h| h.mkv.clone()).unwrap_or_default();
         if let Some(h) = &hdr {
@@ -426,7 +467,7 @@ impl<'a> Encoder<'a> {
             fps_den,
             fps,
             seek_offset,
-            nv_args: nv,
+            enc_args: nv,
             gpu,
             download,
             vmaf_scaled,
@@ -443,7 +484,7 @@ impl<'a> Encoder<'a> {
         let signature = [
             src_str.clone(),
             src_len.to_string(),
-            format!("nvenc={}", enc.nv_args.join(" ")),
+            format!("{}={}", if svt { "svt" } else { "nvenc" }, enc.enc_args.join(" ")),
             format!("model={vmaf_model}"),
             format!("vmaf1080={}", ps_bool(vmaf_scaled)),
             format!("subsample={}", s.vmaf_subsample),
@@ -482,7 +523,11 @@ impl<'a> Encoder<'a> {
         let (audio_file, subs_file) = enc.audio_and_subs(&work, &audio, &subs, duration)?;
 
         // ------------------------------------------------ базовый Q
-        let q_base = if s.q > 0 { s.q } else { enc.pick_q(&sample_dir, total_frames)? };
+        let q_base = if s.q > 0 && !svt {
+            s.q
+        } else {
+            enc.pick_q(&sample_dir, total_frames)?
+        };
 
         // ------------------------------------------------ смены сцен и куски
         if !scenes_file.is_file() {
@@ -527,11 +572,12 @@ impl<'a> Encoder<'a> {
                 Chunk { id: i, start: bounds[i], frames: end - bounds[i], q: q_base, results: Vec::new(), done: false, fresh: false }
             })
             .collect();
-        rep.info(format!("Смен сцен: {}, кусков: {}, кадров: {total_frames}, одновременно: {}", cuts.len(), chunks.len(), s.workers));
+        rep.info(format!("Смен сцен: {}, кусков: {}, кадров: {total_frames}, одновременно: {}", cuts.len(), chunks.len(), if svt { s.svt_workers } else { s.workers }));
 
         rep.step(format!(
-            "Кодирование кусков: базовый Q {q_base}, пресет {}, порог: среднее {}, 1% худших {}",
-            s.preset,
+            "Кодирование кусков{}: базовый {qn} {q_base}, пресет {}, порог: среднее {}, 1% худших {}",
+            if svt { " на процессоре (SVT-AV1)" } else { "" },
+            if svt { s.svt_preset.to_string() } else { s.preset.clone() },
             num(s.target_vmaf - s.tolerance, 2),
             num(s.floor_vmaf - s.tolerance, 2)
         ));
@@ -693,10 +739,10 @@ impl<'a> Encoder<'a> {
         qs.sort();
         let mut groups: Vec<String> = Vec::new();
         for q in qs.iter().copied().collect::<std::collections::BTreeSet<_>>() {
-            groups.push(format!("Q {q}: {}", qs.iter().filter(|&&x| x == q).count()));
+            groups.push(format!("{qn} {q}: {}", qs.iter().filter(|&&x| x == q).count()));
         }
-        rep.good(format!("Кусков: {}, перекодировано с пониженным Q: {retried}, ниже порога осталось: {}", chunks.len(), failed.len()));
-        rep.good(format!("Итоговые Q: {}", groups.join(", ")));
+        rep.good(format!("Кусков: {}, перекодировано с пониженным {qn}: {retried}, ниже порога осталось: {}", chunks.len(), failed.len()));
+        rep.good(format!("Итоговые {qn}: {}", groups.join(", ")));
         rep.good(format!("VMAF фильма: {}", fmt_stats(&total)));
         rep.good(format!(
             "Видео {}, всего {} ({:.1}% от исходника {})",
@@ -746,8 +792,11 @@ impl<'a> Encoder<'a> {
         a.extend(["-pix_fmt", "yuv420p10le", "-strict", "-1", "-an", "-sn", "-dn", "-f", "yuv4mpegpipe", "-"].map(os));
         let part = with_ext(out, "part.ivf");
         let ff = Cmd { exe: self.tools.ffmpeg.clone(), args: a, dir: None };
-        let nv = Cmd::new(&self.tools.nvencc).args(["--y4m", "-i", "-"]).args(self.nv_args.iter()).arg("--qvbr").arg(q.to_string()).arg("-o").arg(&part);
-        Spec { slot: Slot::Enc, cmds: vec![ff, nv], part, fin: out.to_path_buf(), label: format!("{label}, кодирование Q {q}") }
+        let (encoder, name) = match (self.s.codec, &self.tools.svt) {
+            (Codec::Svt, Some(svt)) => (Cmd::new(svt).args(self.enc_args.iter()).arg("--crf").arg(q.to_string()).arg("-b").arg(&part), "CRF"),
+            _ => (Cmd::new(&self.tools.nvencc).args(["--y4m", "-i", "-"]).args(self.enc_args.iter()).arg("--qvbr").arg(q.to_string()).arg("-o").arg(&part), "Q"),
+        };
+        Spec { slot: Slot::Enc, cmds: vec![ff, encoder], part, fin: out.to_path_buf(), label: format!("{label}, кодирование {name} {q}") }
     }
 
     // Кадры сопоставляются по номеру, а не по времени: в MKV время округлено до миллисекунды,
@@ -784,7 +833,8 @@ impl<'a> Encoder<'a> {
     // Выполняет задачи параллельно: advance возвращает следующий запуск задачи или None, если она готова.
     // Кодирований не больше workers (видеопамять), VMAF — отдельный слот.
     fn run_tasks<T>(&self, tasks: &mut [T], mut advance: impl FnMut(&mut T) -> Res<Option<Spec>>, mut tick: impl FnMut()) -> Res<()> {
-        let slots = |k: Slot| if k == Slot::Enc { self.s.workers } else { 1 };
+        let workers = if self.s.codec == Codec::Svt { self.s.svt_workers } else { self.s.workers };
+        let slots = |k: Slot| if k == Slot::Enc { workers } else { 1 };
         let mut pending: VecDeque<(usize, Option<Spec>)> = (0..tasks.len()).map(|i| (i, None)).collect();
         let mut running: Vec<(usize, Spec, Running)> = Vec::new();
         loop {
@@ -959,21 +1009,25 @@ impl<'a> Encoder<'a> {
                 .map(|i| (((total_frames as f64) * (0.05 + 0.85 * (i as f64 + 0.5) / s.sample_count as f64)).floor() as i64, sample_frames))
                 .collect()
         };
+        let (min_q, max_q) = s.q_range();
+        let qn = s.q_name();
         self.rep.step(format!(
-            "Подбор базового Q в границах {}..{} на {} отрезках по {} с (цель: среднее {}, 1% худших {})",
-            s.min_q,
-            s.max_q,
+            "Подбор базового {qn} в границах {min_q}..{max_q} на {} отрезках по {} с (цель: среднее {}, 1% худших {})",
             samples.len(),
             num(samples[0].1 as f64 / self.fps, 0),
             num(s.target_vmaf, 2),
             num(s.floor_vmaf, 2)
         ));
-        let (mut lo, mut hi, mut found) = (s.min_q, s.max_q, 0);
-        let steps = ((s.max_q - s.min_q + 1) as f64).log2().ceil().max(1.0);
+        let (mut lo, mut hi, mut found) = (min_q, max_q, 0);
+        let steps = ((max_q - min_q + 1) as f64).log2().ceil().max(1.0);
         let mut step = 0.0;
+        // У SVT-AV1 потолок CRF низкий и обычно сам проходит по VMAF: с него и начинаем,
+        // чтобы не тратить на подбор лишние десятки минут процессора.
+        let mut probe_max = s.codec == Codec::Svt;
         while lo <= hi {
-            let mid = (lo + hi) / 2;
-            self.rep.progress(Some(step / steps), format!("пробую Q {mid}"));
+            let mid = if probe_max { hi } else { (lo + hi) / 2 };
+            probe_max = false;
+            self.rep.progress(Some(step / steps), format!("пробую {qn} {mid}"));
             struct Sample {
                 start: i64,
                 frames: i64,
@@ -1011,7 +1065,7 @@ impl<'a> Encoder<'a> {
             let frames: i64 = samples.iter().map(|x| x.1).sum();
             let estimate = bytes / frames as f64 * total_frames as f64;
             let ok = st.mean >= s.target_vmaf && st.low >= s.floor_vmaf;
-            let line = format!("  Q {mid}: {}, видео около {}: {}", fmt_stats(&st), size(estimate), if ok { "подходит" } else { "мало" });
+            let line = format!("  {qn} {mid}: {}, видео около {}: {}", fmt_stats(&st), size(estimate), if ok { "подходит" } else { "мало" });
             if ok {
                 self.rep.good(line);
                 found = mid;
@@ -1023,10 +1077,10 @@ impl<'a> Encoder<'a> {
             step += 1.0;
         }
         if found == 0 {
-            self.rep.warn(format!("Даже Q {} не даёт нужного VMAF на отрезках. Базовый Q {}.", s.min_q, s.min_q));
-            found = s.min_q;
+            self.rep.warn(format!("Даже {qn} {min_q} не даёт нужного VMAF на отрезках. Базовый {qn} {min_q}."));
+            found = min_q;
         }
-        self.rep.good(format!("Базовый Q {found}."));
+        self.rep.good(format!("Базовый {qn} {found}."));
         Ok(found)
     }
 
@@ -1061,6 +1115,8 @@ impl<'a> Encoder<'a> {
 
     fn encode_chunks(&self, chunk_dir: &Path, chunks: &mut [Chunk], total_frames: i64) -> Res<()> {
         let s = self.s;
+        let (min_q, _) = s.q_range();
+        let qn = s.q_name();
         let count = chunks.len();
         let started = Instant::now();
         let mut done_frames: i64 = 0;
@@ -1079,19 +1135,20 @@ impl<'a> Encoder<'a> {
                         let passed = st.mean >= s.target_vmaf - s.tolerance && st.low >= s.floor_vmaf - s.tolerance;
                         let size = std::fs::metadata(&ivf).map(|m| m.len()).unwrap_or(0);
                         c.results.push(Attempt { q: c.q, size, ivf, csv, passed });
-                        let line = format!("[{:>3}/{count}] {} Q {}: {}", c.id + 1, time(c.start as f64 / self.fps), c.q, fmt_stats(&st));
+                        let line = format!("[{:>3}/{count}] {} {qn} {}: {}", c.id + 1, time(c.start as f64 / self.fps), c.q, fmt_stats(&st));
                         if passed {
                             self.rep.good(format!("{line} — принято"));
                             c.done = true;
-                        } else if c.results.len() >= s.max_attempts || c.q <= s.min_q {
+                        } else if c.results.len() >= s.max_attempts || c.q <= min_q {
                             self.rep.bad(format!("{line} — ниже порога, попытки кончились, остаётся так"));
                             c.done = true;
                         } else {
-                            // QVBR NVENC: 0,1-0,4 VMAF на единицу Q. Шаг с запасом: повторное кодирование дороже лишнего битрейта.
+                            // QVBR NVENC: 0,1-0,4 VMAF на единицу Q, у SVT-AV1 около 0,25-0,3 на единицу CRF.
+                            // Шаг с запасом: повторное кодирование дороже лишнего битрейта.
                             let short = (s.target_vmaf - s.tolerance - st.mean).max(s.floor_vmaf - s.tolerance - st.low);
                             let step = ((short / 0.25).ceil() as i32 + 1).clamp(2, 10);
-                            let next = (c.q - step).max(s.min_q);
-                            self.rep.warn(format!("{line} — проседает, Q {} -> {next}", c.q));
+                            let next = (c.q - step).max(min_q);
+                            self.rep.warn(format!("{line} — проседает, {qn} {} -> {next}", c.q));
                             c.q = next;
                         }
                         if c.done {
@@ -1148,6 +1205,41 @@ struct Hdr {
     text: String,
     // Те же метаданные для mkvmerge (дорожка 0 файла видео).
     mkv: Vec<String>,
+    // И для SvtAv1EncApp.
+    svt: Vec<String>,
+}
+
+// Параметры SvtAv1EncApp: кадры из y4m со стандартного входа, GOP 10 с, цвет и метаданные HDR.
+// CRF и выходной файл добавляются для каждого куска.
+fn svt_args(video: &Stream, s: &Settings, fps: f64, hdr: Option<&Hdr>) -> Vec<String> {
+    let mut a: Vec<String> = ["-i", "stdin", "--input-depth", "10", "--no-progress", "1", "--preset"].map(String::from).to_vec();
+    a.push(s.svt_preset.to_string());
+    a.extend(["--keyint".into(), ((10.0 * fps).round_ties_even() as i64).to_string()]);
+    // Коды цвета по H.273, как их называет ffprobe.
+    let code = |table: &[(&str, u8)], value: &str| table.iter().find(|(name, _)| *name == value).map(|(_, c)| c.to_string());
+    let primaries = [("bt709", 1), ("bt470m", 4), ("bt470bg", 5), ("smpte170m", 6), ("smpte240m", 7), ("film", 8), ("bt2020", 9), ("smpte428", 10), ("smpte431", 11), ("smpte432", 12)];
+    let transfer = [
+        ("bt709", 1), ("gamma22", 4), ("bt470m", 4), ("gamma28", 5), ("bt470bg", 5), ("smpte170m", 6), ("smpte240m", 7), ("linear", 8),
+        ("iec61966-2-4", 11), ("bt1361e", 12), ("iec61966-2-1", 13), ("bt2020-10", 14), ("bt2020-12", 15), ("smpte2084", 16), ("smpte428", 17), ("arib-std-b67", 18),
+    ];
+    let matrix = [("bt709", 1), ("fcc", 4), ("bt470bg", 5), ("smpte170m", 6), ("smpte240m", 7), ("ycgco", 8), ("bt2020nc", 9), ("bt2020c", 10)];
+    let range = [("tv", 0), ("pc", 1)];
+    let colour = [
+        ("--color-primaries", code(&primaries, &video.color_primaries)),
+        ("--transfer-characteristics", code(&transfer, &video.color_transfer)),
+        ("--matrix-coefficients", code(&matrix, &video.color_space)),
+        ("--color-range", code(&range, &video.color_range)),
+    ];
+    for (option, value) in colour {
+        if let Some(v) = value {
+            a.extend([option.to_string(), v]);
+        }
+    }
+    if let Some(h) = hdr {
+        a.extend(h.svt.iter().cloned());
+    }
+    a.extend(s.svt_params.split_whitespace().map(String::from));
+    a
 }
 
 fn nvenc_args(tools: &Tools, source: &Path, video: &Stream, s: &Settings, fps: f64) -> Res<(Vec<String>, Option<Hdr>)> {
@@ -1176,6 +1268,7 @@ fn nvenc_args(tools: &Tools, source: &Path, video: &Stream, s: &Settings, fps: f
     let r = |v: &serde_json::Value, k: &str| rational(v[k].as_str().unwrap_or(""));
     let mut parts = Vec::new();
     let mut mkv: Vec<String> = Vec::new();
+    let mut svt: Vec<String> = Vec::new();
     if let Some(m) = find("Mastering display metadata") {
         // Единицы SEI: координаты в 1/50000, яркость в 1/10000 кд/м².
         let p = |x: &str, y: &str| format!("({},{})", (r(&m, x) * 50000.0).round_ties_even(), (r(&m, y) * 50000.0).round_ties_even());
@@ -1202,14 +1295,28 @@ fn nvenc_args(tools: &Tools, source: &Path, video: &Stream, s: &Settings, fps: f
             "--min-luminance".into(),
             format!("0:{}", c("min_luminance")),
         ]);
+        let xy = |x: &str, y: &str| format!("({},{})", c(x), c(y));
+        svt.extend([
+            "--mastering-display".into(),
+            format!(
+                "G{}B{}R{}WP{}L({},{})",
+                xy("green_x", "green_y"),
+                xy("blue_x", "blue_y"),
+                xy("red_x", "red_y"),
+                xy("white_point_x", "white_point_y"),
+                c("max_luminance"),
+                c("min_luminance")
+            ),
+        ]);
     }
     if let Some(l) = find("Content light level metadata") {
         let v = format!("{},{}", l["max_content"], l["max_average"]);
         nv.extend(["--max-cll".into(), v.clone()]);
+        svt.extend(["--content-light".into(), v.clone()]);
         parts.push(format!("max-cll {v}"));
         mkv.extend(["--max-content-light".into(), format!("0:{}", l["max_content"]), "--max-frame-light".into(), format!("0:{}", l["max_average"])]);
     }
-    Ok((nv, Some(Hdr { text: if parts.is_empty() { "нет".into() } else { parts.join(" ") }, mkv })))
+    Ok((nv, Some(Hdr { text: if parts.is_empty() { "нет".into() } else { parts.join(" ") }, mkv, svt })))
 }
 
 fn read_vmaf(path: &Path) -> Res<Vec<f64>> {
@@ -1350,7 +1457,7 @@ mod tests {
             fps_den: 1,
             fps: 24.0,
             seek_offset: 0.0,
-            nv_args: Vec::new(),
+            enc_args: Vec::new(),
             gpu: false,
             download: String::new(),
             vmaf_scaled: false,
@@ -1374,6 +1481,35 @@ mod tests {
             }
             assert_eq!(streams.len(), expected);
         }
+    }
+
+    // Настоящее кодирование начала фильма целиком, как из окна. Занимает видеокарту: не запускать, пока идёт другое кодирование.
+    // AV1_SRC=путь AV1_OUT=итог.mkv [AV1_CODEC=svt] [AV1_LIMIT=секунд] [AV1_CRF=потолок] [AV1_VMAF=цель] cargo test --release -- --ignored --nocapture sample_run
+    #[test]
+    #[ignore]
+    fn sample_run() {
+        let src = std::env::var("AV1_SRC").expect("AV1_SRC");
+        let output = PathBuf::from(std::env::var("AV1_OUT").expect("AV1_OUT"));
+        let tools = crate::tools::find_existing().tools().expect("tools");
+        let plan = crate::tracks::analyze(&tools, Path::new(&src)).unwrap();
+        let mut settings = Settings { limit: std::env::var("AV1_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(30), ..Settings::default() };
+        if std::env::var("AV1_CODEC").as_deref() == Ok("svt") {
+            settings.codec = Codec::Svt;
+        }
+        if let Some(crf) = std::env::var("AV1_CRF").ok().and_then(|v| v.parse().ok()) {
+            settings.svt_max_crf = crf;
+        }
+        if let Some(target) = std::env::var("AV1_VMAF").ok().and_then(|v| v.parse().ok()) {
+            settings.target_vmaf = target;
+        }
+        let state = Arc::new(Mutex::new(RunState::default()));
+        let rep = Reporter::new(state.clone());
+        let job = Job { title: plan.title.clone(), plan, output, settings };
+        let result = Encoder::run(&job, &tools, &rep, &AtomicBool::new(false));
+        for (_, line) in &state.lock().unwrap().log {
+            println!("{line}");
+        }
+        result.unwrap();
     }
 
     // Разбор файла без кодирования: AV1_SRC=путь cargo test --release -- --ignored --nocapture dump_plan

@@ -10,7 +10,7 @@ mod tracks;
 mod util;
 
 use eframe::egui::{self, RichText, Stroke};
-use encode::{Level, RunState, Settings};
+use encode::{Codec, Level, RunState, Settings};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,11 +37,16 @@ fn is_track_file(path: &Path) -> bool {
 struct Saved {
     target_vmaf: f64,
     floor_vmaf: f64,
+    // Кодировщик и настройки SVT-AV1 (кодирование на процессоре с сохранением зерна).
+    codec: Codec,
+    svt_max_crf: i32,
+    svt_preset: i32,
 }
 
 impl Default for Saved {
     fn default() -> Self {
-        Self { target_vmaf: 95.0, floor_vmaf: 88.0 }
+        let s = Settings::default();
+        Self { target_vmaf: s.target_vmaf, floor_vmaf: s.floor_vmaf, codec: s.codec, svt_max_crf: s.svt_max_crf, svt_preset: s.svt_preset }
     }
 }
 
@@ -247,6 +252,9 @@ impl App {
         let settings = Settings {
             target_vmaf: self.saved.target_vmaf,
             floor_vmaf: self.saved.floor_vmaf,
+            codec: self.saved.codec,
+            svt_max_crf: self.saved.svt_max_crf,
+            svt_preset: self.saved.svt_preset,
             limit: if self.test_run { self.test_seconds } else { 0 },
             ..Settings::default()
         };
@@ -285,11 +293,12 @@ impl App {
                     ui.spacing_mut().item_spacing.y = 2.0;
                     if let Some(t) = loc.tools() {
                         let hint = format!(
-                            "ffmpeg: {}{}\nNVEncC: {}\nmkvmerge: {}",
+                            "ffmpeg: {}{}\nNVEncC: {}\nmkvmerge: {}\nSVT-AV1 (Tritium): {}",
                             t.ffmpeg.display(),
                             if t.scale_cuda { "" } else { " (без scale_cuda)" },
                             t.nvencc.display(),
-                            t.mkvmerge.display()
+                            t.mkvmerge.display(),
+                            t.svt.as_ref().map_or("не найден".to_string(), |p| p.display().to_string())
                         );
                         ui.horizontal(|ui| {
                             theme::dot(ui, p.good);
@@ -334,12 +343,44 @@ impl App {
                 });
                 return;
             }
+            // Кодировщик: видеокарта (быстро, без зерна) или процессор (SVT-AV1 с сохранением зерна).
+            let svt_found = self.tools().is_some_and(|t| t.svt.is_some());
+            if !svt_found && self.locating.is_none() {
+                self.saved.codec = Codec::Nvenc;
+            }
+            ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                if theme::chip(ui, self.saved.codec == Codec::Nvenc, "Видеокарта").on_hover_text("NVENC: быстро, качество подбирается по VMAF.\nПлёночное зерно не сохраняется.").clicked() {
+                    self.saved.codec = Codec::Nvenc;
+                }
+                ui.add_enabled_ui(svt_found, |ui| {
+                    let hint = if svt_found {
+                        "SVT-AV1 (Tritium), tune Film Grain: плёночное зерно сохраняется.\nВ несколько раз медленнее видеокарты, качество задаёт CRF.".to_string()
+                    } else {
+                        format!("Нужен SvtAv1EncApp форка Tritium (tune 5 — Film Grain).\nОн берётся из StaxRip или из папки {}", tools::app_tools_dir().display())
+                    };
+                    if theme::chip(ui, self.saved.codec == Codec::Svt, "Процессор, с зерном").on_hover_text(hint.clone()).on_disabled_hover_text(hint).clicked() {
+                        self.saved.codec = Codec::Svt;
+                    }
+                });
+            });
+            ui.add_space(6.0);
+            // Пороги VMAF общие: по ним подбирается Q у видеокарты и CRF у процессора.
             ui.label(theme::weak(ui, "VMAF"));
             ui.add(egui::DragValue::new(&mut self.saved.target_vmaf).range(80.0..=99.0).speed(0.1).fixed_decimals(1))
                 .on_hover_text("Средний VMAF каждого куска — не ниже этого значения");
             ui.label(theme::weak(ui, "худший 1%"));
             ui.add(egui::DragValue::new(&mut self.saved.floor_vmaf).range(60.0..=99.0).speed(0.1).fixed_decimals(1))
                 .on_hover_text("1% худших кадров каждого куска — не ниже этого значения");
+            if self.saved.codec == Codec::Svt {
+                ui.label(theme::weak(ui, "CRF до"));
+                ui.add(egui::DragValue::new(&mut self.saved.svt_max_crf).range(21..=60)).on_hover_text(
+                    "Потолок CRF. Подбор по VMAF не поднимется выше него: VMAF зерна не видит,\nа выше 40–44 зерно грубеет и в тёмных сценах плывёт цвет.\n32 — почти неотличимо от исходника, 38–40 — зерно сохраняется.",
+                );
+                ui.label(theme::weak(ui, "пресет"));
+                ui.add(egui::DragValue::new(&mut self.saved.svt_preset).range(2..=10))
+                    .on_hover_text("Меньше — медленнее. 6 — около 10 кадр/с на 4K;\n4 вдвое медленнее при том же размере и зерне, 8 вдвое быстрее, но файл на 20% больше.");
+            }
             ui.add_space(6.0);
             ui.separator();
             ui.add_space(6.0);
@@ -907,7 +948,7 @@ fn suggested(output: &Path, title: &str, test_run: bool) -> Option<String> {
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1180.0, 780.0]).with_min_inner_size([940.0, 520.0]).with_drag_and_drop(true),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1180.0, 780.0]).with_min_inner_size([1080.0, 520.0]).with_drag_and_drop(true),
         ..Default::default()
     };
     eframe::run_native("AV1 — перекодирование", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
