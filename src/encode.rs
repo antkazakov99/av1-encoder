@@ -2,7 +2,7 @@
 // с контролем VMAF, склейка и сборка MKV без лишних тегов.
 //
 // Промежуточные файлы лежат в "<итог>.work" и называются как у прежнего скрипта
-// Convert-ToAv1.ps1, так что прерванный запуск (в том числе скриптом) продолжается с готовых кусков.
+// Convert-ToAv1.ps1 (удалён, есть в истории git), так что прерванный запуск продолжается с готовых кусков.
 use crate::tools::Tools;
 use crate::tracks::{probe, tag, Kind, Plan, Stream, Track};
 use crate::util::*;
@@ -55,6 +55,10 @@ pub struct Settings {
     pub nvenc_params: String,
     // Только первые N секунд: пробный прогон.
     pub limit: u32,
+    // Откуда начинается пробный прогон, секунд от начала видео (только при limit > 0).
+    pub start: f64,
+    // Ширина итога (высота по пропорции); 0 или не меньше исходной — без уменьшения.
+    pub width: i64,
     pub keep_work: bool,
     pub cpu_decode: bool,
     // Для видео больше 1080p считать VMAF в исходном разрешении (втрое медленнее).
@@ -86,6 +90,8 @@ impl Default for Settings {
             workers: 2,
             nvenc_params: "--tune uhq --lookahead 32 --lookahead-level 3 --aq --aq-temporal --bframes 4 --tf-level 4 --multipass 2pass-full".into(),
             limit: 0,
+            start: 0.0,
+            width: 0,
             keep_work: false,
             cpu_decode: false,
             native_vmaf: false,
@@ -253,11 +259,15 @@ struct Encoder<'a> {
     fps_den: i64,
     fps: f64,
     seek_offset: f64,
+    // Первый кадр пробного прогона в исходнике; 0 — с начала.
+    base: i64,
     enc_args: Vec<String>,
     gpu: bool,
     download: String,
     vmaf_scaled: bool,
     vmaf_model: &'static str,
+    // Уменьшение кадра до выбранного разрешения (фильтр ffmpeg); None — исходное.
+    scale_filter: Option<String>,
     threads: usize,
 }
 
@@ -281,6 +291,22 @@ fn move_file(from: &Path, to: &Path) -> Res<()> {
         std::fs::rename(from, to)
     })
     .map_err(|e| format!("Не удалось переименовать {} в {}: {e}", from.display(), to.display()))
+}
+
+// Имя отрезка подбора без расширения: .ivf — видео, .csv — журнал VMAF.
+fn sample_base(sample_dir: &Path, start: i64, frames: i64, q: i32) -> PathBuf {
+    sample_dir.join(format!("s{start}_{frames}_q{q}"))
+}
+
+// Жёсткая ссылка (рабочая папка на одном диске, места не занимает), иначе копия через .part.
+fn link_or_copy(from: &Path, to: &Path) -> Res<()> {
+    let _ = std::fs::remove_file(to);
+    if std::fs::hard_link(from, to).is_ok() {
+        return Ok(());
+    }
+    let part = add_ext(to, ".part");
+    std::fs::copy(from, &part).map_err(|e| format!("Не удалось скопировать {} в {}: {e}", from.display(), part.display()))?;
+    move_file(&part, to)
 }
 
 fn os(s: impl AsRef<std::ffi::OsStr>) -> OsString {
@@ -342,7 +368,7 @@ impl<'a> Encoder<'a> {
         if limit > 0 && (limit as f64) < duration {
             duration = limit as f64;
         }
-        let video: Stream = pr.streams.iter().find(|x| x.codec_type == "video" && !x.flag("attached_pic")).cloned().ok_or("В файле нет видеодорожки.")?;
+        let mut video: Stream = pr.streams.iter().find(|x| x.codec_type == "video" && !x.flag("attached_pic")).cloned().ok_or("В файле нет видеодорожки.")?;
 
         let audio: Vec<&Track> = plan.tracks.iter().filter(|t| t.kind == Kind::Audio && t.keep).collect();
         let subs: Vec<&Track> = plan.tracks.iter().filter(|t| t.kind == Kind::Subtitle && t.keep).collect();
@@ -379,6 +405,10 @@ impl<'a> Encoder<'a> {
             "Видео: {} {}x{}, {} кадр/с, {}, длительность {}",
             video.codec_name, video.width, video.height, num(fps, 3), video.pix_fmt, time(duration)
         ));
+        let filled = fill_colour(&mut video);
+        if !filled.is_empty() {
+            rep.warn(format!("В исходнике не указан цвет. Записывается то, что подставляют плееры: {}.", filled.join(", ")));
+        }
         if !video.field_order.is_empty() && video.field_order != "progressive" && video.field_order != "unknown" {
             rep.warn(format!("Видео чересстрочное ({}): AV1 такого не хранит, деинтерлейс не делается.", video.field_order));
         }
@@ -394,8 +424,13 @@ impl<'a> Encoder<'a> {
             rep.info("Подсчёт кадров...");
             total_frames = count_frames(tools, &source, &video.index.to_string())?;
         }
+        // Пробный прогон с середины фильма: все номера кадров дальше считаются от его первого кадра,
+        // а к исходнику прибавляется base (поиск, звук, смены сцен, VMAF).
+        let mut base: i64 = 0;
         if limit > 0 {
-            total_frames = total_frames.min((limit as f64 * fps).round_ties_even() as i64);
+            base = ((s.start * fps).round_ties_even() as i64).clamp(0, (total_frames - 1).max(0));
+            total_frames = (total_frames - base).min((limit as f64 * fps).round_ties_even() as i64);
+            rep.info(format!("Пробный прогон: {} с, с {}", limit, time(base as f64 / fps)));
         }
 
         // Dolby Vision: кадры идут в NVEncC без метаданных, остаётся совместимый базовый слой.
@@ -420,7 +455,6 @@ impl<'a> Encoder<'a> {
             return Err("Не найден SvtAv1EncApp с tune «Film Grain» (форк Tritium): он берётся из StaxRip или из папки программ приложения.".into());
         }
         let nv = if svt { svt_args(&video, s, fps, hdr.as_ref()) } else { nv };
-        let is_hdr = hdr.is_some();
         let hdr_mkv = hdr.as_ref().map(|h| h.mkv.clone()).unwrap_or_default();
         if let Some(h) = &hdr {
             rep.info(format!("HDR: {}, метаданные: {}", video.color_transfer, h.text));
@@ -444,10 +478,30 @@ impl<'a> Encoder<'a> {
         }
         rep.info(format!("Декодирование: {}", if gpu { "видеокарта (NVDEC)" } else { "процессор" }));
 
+        // Уменьшение кадра: по ширине, высота по пропорции (чётная), чтобы не резать широкий кадр.
+        let resize = (s.width > 0 && s.width < video.width).then(|| {
+            let h = ((video.height as f64 * s.width as f64 / video.width as f64 / 2.0).round_ties_even() as i64 * 2).max(2);
+            (s.width, h)
+        });
+        let (out_w, out_h) = resize.unwrap_or((video.width, video.height));
+        // Lanczos; положение цветности то же, что записывается в итог (у UHD — topleft).
+        let scale_filter = resize.map(|(w, h)| {
+            let loc = match chroma_location(&video) {
+                Some("left") => ":in_chroma_loc=1:out_chroma_loc=1",
+                Some("topleft") => ":in_chroma_loc=3:out_chroma_loc=3",
+                _ => "",
+            };
+            format!("scale={w}:{h}:flags=lanczos{loc}")
+        });
+        if resize.is_some() {
+            rep.info(format!("Разрешение: {}x{} -> {out_w}x{out_h}", video.width, video.height));
+        }
+
         // VMAF для видео больше 1080p считается в 1080p: 4K-модель на процессоре втрое медленнее,
-        // а оценка в 1080p получается не мягче.
-        let vmaf_scaled = !s.native_vmaf && (video.width > 1920 || video.height > 1080);
-        let vmaf_model = if !vmaf_scaled && (video.width >= 3000 || video.height >= 1700) { "vmaf_4k_v0.6.1" } else { "vmaf_v0.6.1" };
+        // а оценка в 1080p получается не мягче. При уменьшении исходник для VMAF уменьшается так же,
+        // как кадры для кодировщика: оценивается сжатие, а не само уменьшение.
+        let vmaf_scaled = !s.native_vmaf && (out_w > 1920 || out_h > 1080);
+        let vmaf_model = if !vmaf_scaled && (out_w >= 3000 || out_h >= 1700) { "vmaf_4k_v0.6.1" } else { "vmaf_v0.6.1" };
         if vmaf_scaled {
             rep.info("VMAF: в 1080p (модель vmaf_v0.6.1).");
         }
@@ -467,11 +521,13 @@ impl<'a> Encoder<'a> {
             fps_den,
             fps,
             seek_offset,
+            base,
             enc_args: nv,
             gpu,
             download,
             vmaf_scaled,
             vmaf_model,
+            scale_filter: scale_filter.clone(),
             threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8),
         };
 
@@ -480,7 +536,9 @@ impl<'a> Encoder<'a> {
         let src_len = std::fs::metadata(&source).map(|m| m.len()).unwrap_or(0);
         let src_str = source.to_string_lossy().to_string();
         let scene = num(s.scene_threshold, 4);
-        let scene_key = format!("{src_str}|{src_len}|scene={scene}|limit={limit}");
+        // Начало пробного прогона дописывается, только если он не с начала: прежние рабочие папки остаются годными.
+        let from = if base > 0 { format!("|start={base}") } else { String::new() };
+        let scene_key = format!("{src_str}|{src_len}|scene={scene}|limit={limit}{from}");
         let signature = [
             src_str.clone(),
             src_len.to_string(),
@@ -490,9 +548,10 @@ impl<'a> Encoder<'a> {
             format!("subsample={}", s.vmaf_subsample),
             format!("chunk={}", num(s.chunk_seconds, 4)),
             format!("scene={scene}"),
-            format!("limit={limit}"),
+            format!("limit={limit}{from}"),
         ]
-        .join("|");
+        .join("|")
+            + &resize.map(|(w, h)| format!("|size={w}x{h}")).unwrap_or_default();
         let signature_path = work.join("signature.txt");
         let sample_dir = work.join("samples");
         let chunk_dir = work.join("chunks");
@@ -538,7 +597,9 @@ impl<'a> Encoder<'a> {
             .lines()
             .filter_map(|l| l.split("pts_time:").nth(1))
             .filter_map(|v| v.split_whitespace().next()?.parse::<f64>().ok())
-            .map(|t| ((t - video_start) * fps).round_ties_even() as i64)
+            // Время кадра в выводе ffmpeg отсчитывается от точки поиска: с поиском (на полкадра раньше
+            // первого кадра пробы) первый кадр стоит на 0,5 кадра, без поиска — на сдвиге видео в файле.
+            .map(|t| ((t - if base > 0 { 0.5 / fps } else { seek_offset }) * fps).round_ties_even() as i64)
             .filter(|&f| f > 0 && f < total_frames)
             .collect();
         cuts.sort();
@@ -581,7 +642,7 @@ impl<'a> Encoder<'a> {
             num(s.target_vmaf - s.tolerance, 2),
             num(s.floor_vmaf - s.tolerance, 2)
         ));
-        enc.encode_chunks(&chunk_dir, &mut chunks, total_frames)?;
+        enc.encode_chunks(&chunk_dir, &sample_dir, &mut chunks, total_frames)?;
 
         // ------------------------------------------------ склейка
         rep.step("Склейка кусков");
@@ -640,6 +701,7 @@ impl<'a> Encoder<'a> {
             "--default-track-flag".into(),
             "0:1".into(),
         ]);
+        m.extend(mkv_colour(&video));
         m.extend(hdr_mkv);
         m.extend([
             "--default-duration".into(),
@@ -669,6 +731,10 @@ impl<'a> Encoder<'a> {
             rep.info(format!("Вложения: убираются {}", images.join(", ")));
         }
         m.extend(["--no-video", "--no-audio", "--no-subtitles", "--no-buttons", "--no-track-tags", "--no-global-tags"].map(String::from));
+        // Главы пробного прогона с середины фильма указывали бы мимо: время в нём начинается с нуля.
+        if base > 0 {
+            m.push("--no-chapters".into());
+        }
         if keep_att.is_empty() {
             m.push("--no-attachments".into());
         } else {
@@ -706,6 +772,9 @@ impl<'a> Encoder<'a> {
         if out_subs != subs.len() {
             problems.push(format!("субтитров {out_subs} вместо {}", subs.len()));
         }
+        if let Some(v) = out_video.filter(|v| (v.width, v.height) != (out_w, out_h)) {
+            problems.push(format!("размер кадра {}x{} вместо {out_w}x{out_h}", v.width, v.height));
+        }
         let out_frames = count_frames(tools, &output, "v:0")?;
         if out_frames != encoded_frames {
             problems.push(format!("кадров {out_frames} вместо {encoded_frames}"));
@@ -718,8 +787,23 @@ impl<'a> Encoder<'a> {
         if tag(&result.format.tags, "title") != movie {
             problems.push(format!("заголовок файла «{}»", tag(&result.format.tags, "title")));
         }
-        if is_hdr && out_video.map(|v| v.color_transfer.as_str()) != Some(video.color_transfer.as_str()) {
-            problems.push(format!("передаточная функция {} вместо {}", out_video.map(|v| v.color_transfer.as_str()).unwrap_or(""), video.color_transfer));
+        if let Some(v) = out_video {
+            let pairs = [
+                ("основные цвета", &v.color_primaries, &video.color_primaries),
+                ("передаточная функция", &v.color_transfer, &video.color_transfer),
+                ("матрица", &v.color_space, &video.color_space),
+                ("диапазон", &v.color_range, &video.color_range),
+            ];
+            for (what, got, want) in pairs {
+                if known_colour(want) && got != want {
+                    problems.push(format!("{what} {got} вместо {want}"));
+                }
+            }
+        }
+        if let (Some(loc), Some(v)) = (chroma_location(&video), out_video) {
+            if v.chroma_location != loc {
+                problems.push(format!("положение цветности {} вместо {loc}", v.chroma_location));
+            }
         }
         let out_info = mkv_info(tools, &output)?;
         if out_info["attachments"].as_array().is_some_and(|a| a.iter().any(is_image)) {
@@ -772,11 +856,21 @@ impl<'a> Encoder<'a> {
     }
 
     // Точный поиск кадра: на полкадра раньше нужного, ffmpeg декодирует и отбрасывает всё до него.
+    // frame считается от начала пробного прогона.
     fn seek_args(&self, frame: i64) -> Vec<OsString> {
+        let frame = self.base + frame;
         if frame <= 0 {
             return Vec::new();
         }
         vec![os("-ss"), os(num(self.seek_offset + (frame as f64 - 0.5) / self.fps, 6))]
+    }
+
+    // Начало пробного прогона в секундах файла для звука и субтитров (у видео — seek_args).
+    fn start_args(&self) -> Vec<OsString> {
+        if self.base <= 0 {
+            return Vec::new();
+        }
+        vec![os("-ss"), os(num(self.seek_offset + self.base as f64 / self.fps, 6))]
     }
 
     // ffmpeg декодирует кадры куска (passthrough: без дублей и пропусков) и передаёт их NVEncC в y4m.
@@ -786,8 +880,13 @@ impl<'a> Encoder<'a> {
         a.extend(self.seek_args(start));
         a.extend([os("-i"), os(&self.source), os("-map"), os(format!("0:{}", self.video_index)), os("-frames:v"), os(frames.to_string())]);
         a.extend(["-fps_mode", "passthrough"].map(os));
+        let mut vf: Vec<String> = Vec::new();
         if self.gpu {
-            a.extend([os("-vf"), os(format!("hwdownload,format={}", self.download))]);
+            vf.push(format!("hwdownload,format={}", self.download));
+        }
+        vf.extend(self.scale_filter.clone());
+        if !vf.is_empty() {
+            a.extend([os("-vf"), os(vf.join(","))]);
         }
         a.extend(["-pix_fmt", "yuv420p10le", "-strict", "-1", "-an", "-sn", "-dn", "-f", "yuv4mpegpipe", "-"].map(os));
         let part = with_ext(out, "part.ivf");
@@ -805,7 +904,13 @@ impl<'a> Encoder<'a> {
         let name = log.file_name().unwrap().to_string_lossy().to_string();
         let tb = format!("settb={}/{},setpts=N", self.fps_den, self.fps_num);
         let (mut d_prep, mut r_prep) = (String::new(), String::new());
-        if self.gpu {
+        if let Some(resize) = &self.scale_filter {
+            // Исходник уменьшается тем же фильтром, что и кадры для кодировщика; итог уже нужного размера.
+            let to1080 = if self.vmaf_scaled { "scale=1920:-2:flags=bicubic," } else { "" };
+            let download = |f: &str| if self.gpu { format!("hwdownload,format={f},") } else { String::new() };
+            d_prep = format!("{}{to1080}", download("p010le"));
+            r_prep = format!("{}{resize},{to1080}", download(&self.download));
+        } else if self.gpu {
             let scale = if self.vmaf_scaled { "scale_cuda=1920:-2:interp_algo=bicubic," } else { "" };
             d_prep = format!("{scale}hwdownload,format=p010le,");
             r_prep = format!("{scale}hwdownload,format={},", self.download);
@@ -911,7 +1016,7 @@ impl<'a> Encoder<'a> {
             maps.push(format!("{input}:{}", t.index));
             plan.push(entry);
         }
-        let hash = short_hash(&format!("{}|{}", plan.join(","), self.s.limit));
+        let hash = short_hash(&if self.base > 0 { format!("{}|{}|{}", plan.join(","), self.s.limit, self.base) } else { format!("{}|{}", plan.join(","), self.s.limit) });
         let audio_file = (!audio.is_empty()).then(|| work.join(format!("audio_{hash}.mka")));
         let subs_file = (!subs.is_empty()).then(|| work.join(format!("subs_{hash}.mks")));
         if audio_file.as_deref().is_none_or(exists) && subs_file.as_deref().is_none_or(exists) {
@@ -940,8 +1045,14 @@ impl<'a> Encoder<'a> {
                 }
             }
         }
-        for input in &inputs {
+        for (n, input) in inputs.iter().enumerate() {
             if self.s.limit > 0 {
+                // Исходник — с того же места, что и видео; дорожки из других файлов идут от начала фильма.
+                if n == 0 {
+                    a.extend(self.start_args());
+                } else if self.base > 0 {
+                    a.extend([os("-ss"), os(num(self.base as f64 / self.fps, 6))]);
+                }
                 a.extend([os("-t"), os(self.s.limit.to_string())]);
             }
             a.extend([os("-i"), os(input)]);
@@ -1038,7 +1149,7 @@ impl<'a> Encoder<'a> {
             let mut tasks: Vec<Sample> = samples
                 .iter()
                 .map(|&(start, frames)| {
-                    let base = sample_dir.join(format!("s{start}_{frames}_q{mid}"));
+                    let base = sample_base(sample_dir, start, frames, mid);
                     Sample { start, frames, ivf: with_ext(&base, "ivf"), csv: with_ext(&base, "csv"), label: format!("отрезок {}", time(start as f64 / self.fps)) }
                 })
                 .collect();
@@ -1089,6 +1200,7 @@ impl<'a> Encoder<'a> {
         let mut a: Vec<OsString> = ["-nostdin", "-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1"].map(os).to_vec();
         a.extend(self.decode_args());
         if self.s.limit > 0 {
+            a.extend(self.seek_args(0));
             a.extend([os("-t"), os(self.s.limit.to_string())]);
         }
         // Кадр уменьшается до 360 строк ещё на видеокарте: на процессор уходит в десятки раз меньше данных.
@@ -1113,7 +1225,7 @@ impl<'a> Encoder<'a> {
         move_file(&part, scenes_file)
     }
 
-    fn encode_chunks(&self, chunk_dir: &Path, chunks: &mut [Chunk], total_frames: i64) -> Res<()> {
+    fn encode_chunks(&self, chunk_dir: &Path, sample_dir: &Path, chunks: &mut [Chunk], total_frames: i64) -> Res<()> {
         let s = self.s;
         let (min_q, _) = s.q_range();
         let qn = s.q_name();
@@ -1170,6 +1282,18 @@ impl<'a> Encoder<'a> {
                     if exists(&ivf) {
                         return Ok(Some(self.vmaf_spec(&ivf, c.start, c.frames, &csv, &label)));
                     }
+                    // Тот же отрезок с тем же качеством уже закодирован при подборе (в коротком пробном
+                    // прогоне отрезок подбора — это весь кусок): команды те же, файл вышел бы тем же до байта.
+                    let sample = sample_base(sample_dir, c.start, c.frames, c.q);
+                    let (sample_ivf, sample_csv) = (with_ext(&sample, "ivf"), with_ext(&sample, "csv"));
+                    if exists(&sample_ivf) {
+                        link_or_copy(&sample_ivf, &ivf)?;
+                        if exists(&sample_csv) {
+                            link_or_copy(&sample_csv, &csv)?;
+                        }
+                        self.rep.info(format!("{label}: {qn} {} уже закодирован при подборе, берётся оттуда", c.q));
+                        continue;
+                    }
                     c.fresh = true;
                     return Ok(Some(self.enc_spec(c.start, c.frames, c.q, &ivf, &label)));
                 }
@@ -1215,31 +1339,108 @@ fn svt_args(video: &Stream, s: &Settings, fps: f64, hdr: Option<&Hdr>) -> Vec<St
     let mut a: Vec<String> = ["-i", "stdin", "--input-depth", "10", "--no-progress", "1", "--preset"].map(String::from).to_vec();
     a.push(s.svt_preset.to_string());
     a.extend(["--keyint".into(), ((10.0 * fps).round_ties_even() as i64).to_string()]);
-    // Коды цвета по H.273, как их называет ffprobe.
-    let code = |table: &[(&str, u8)], value: &str| table.iter().find(|(name, _)| *name == value).map(|(_, c)| c.to_string());
-    let primaries = [("bt709", 1), ("bt470m", 4), ("bt470bg", 5), ("smpte170m", 6), ("smpte240m", 7), ("film", 8), ("bt2020", 9), ("smpte428", 10), ("smpte431", 11), ("smpte432", 12)];
-    let transfer = [
-        ("bt709", 1), ("gamma22", 4), ("bt470m", 4), ("gamma28", 5), ("bt470bg", 5), ("smpte170m", 6), ("smpte240m", 7), ("linear", 8),
-        ("iec61966-2-4", 11), ("bt1361e", 12), ("iec61966-2-1", 13), ("bt2020-10", 14), ("bt2020-12", 15), ("smpte2084", 16), ("smpte428", 17), ("arib-std-b67", 18),
-    ];
-    let matrix = [("bt709", 1), ("fcc", 4), ("bt470bg", 5), ("smpte170m", 6), ("smpte240m", 7), ("ycgco", 8), ("bt2020nc", 9), ("bt2020c", 10)];
-    let range = [("tv", 0), ("pc", 1)];
-    let colour = [
-        ("--color-primaries", code(&primaries, &video.color_primaries)),
-        ("--transfer-characteristics", code(&transfer, &video.color_transfer)),
-        ("--matrix-coefficients", code(&matrix, &video.color_space)),
-        ("--color-range", code(&range, &video.color_range)),
-    ];
+    let c = h273(video);
+    let range = match video.color_range.as_str() {
+        "tv" => Some(0),
+        "pc" => Some(1),
+        _ => None,
+    };
+    let colour = [("--color-primaries", c.primaries), ("--transfer-characteristics", c.transfer), ("--matrix-coefficients", c.matrix), ("--color-range", range)];
     for (option, value) in colour {
         if let Some(v) = value {
-            a.extend([option.to_string(), v]);
+            a.extend([option.to_string(), v.to_string()]);
         }
+    }
+    if let Some(loc) = chroma_location(video) {
+        a.extend(["--chroma-sample-position".into(), loc.into()]);
     }
     if let Some(h) = hdr {
         a.extend(h.svt.iter().cloned());
     }
     a.extend(s.svt_params.split_whitespace().map(String::from));
     a
+}
+
+// Коды цвета по H.273 (их же берут SvtAv1EncApp и MKV) для названий, которые выдаёт ffprobe.
+struct H273 {
+    primaries: Option<u8>,
+    transfer: Option<u8>,
+    matrix: Option<u8>,
+}
+
+fn h273(video: &Stream) -> H273 {
+    let code = |table: &[(&str, u8)], value: &str| table.iter().find(|(name, _)| *name == value).map(|(_, c)| *c);
+    let primaries = [("bt709", 1), ("bt470m", 4), ("bt470bg", 5), ("smpte170m", 6), ("smpte240m", 7), ("film", 8), ("bt2020", 9), ("smpte428", 10), ("smpte431", 11), ("smpte432", 12)];
+    let transfer = [
+        ("bt709", 1), ("gamma22", 4), ("bt470m", 4), ("gamma28", 5), ("bt470bg", 5), ("smpte170m", 6), ("smpte240m", 7), ("linear", 8),
+        ("iec61966-2-4", 11), ("bt1361e", 12), ("iec61966-2-1", 13), ("bt2020-10", 14), ("bt2020-12", 15), ("smpte2084", 16), ("smpte428", 17), ("arib-std-b67", 18),
+    ];
+    let matrix = [("bt709", 1), ("fcc", 4), ("bt470bg", 5), ("smpte170m", 6), ("smpte240m", 7), ("ycgco", 8), ("bt2020nc", 9), ("bt2020c", 10)];
+    H273 { primaries: code(&primaries, &video.color_primaries), transfer: code(&transfer, &video.color_transfer), matrix: code(&matrix, &video.color_space) }
+}
+
+fn known_colour(v: &str) -> bool {
+    !v.is_empty() && v != "unknown" && v != "unspecified"
+}
+
+// Теги цвета, которых нет в исходнике, по тем же правилам, по которым их угадывают плееры:
+// HD — BT.709, 576 строк — PAL (BT.601-625), остальное SD — NTSC (BT.601-525); диапазон ограниченный, у yuvj — полный.
+// У H.264 без тегов любой плеер берёт BT.709, а у AV1 без тегов многие (Windows, браузеры, телевизоры) — BT.601,
+// и цвет уезжает: зелёный буреет, красный желтеет. Возвращает, что дописано, для журнала.
+pub fn fill_colour(video: &mut Stream) -> Vec<String> {
+    let mut filled = Vec::new();
+    if !known_colour(&video.color_primaries) && !known_colour(&video.color_transfer) && !known_colour(&video.color_space) {
+        let hd = video.width > 1024 || video.height > 576;
+        let (primaries, transfer, matrix) = if hd {
+            ("bt709", "bt709", "bt709")
+        } else if video.height == 576 {
+            ("bt470bg", "smpte170m", "bt470bg")
+        } else {
+            ("smpte170m", "smpte170m", "smpte170m")
+        };
+        video.color_primaries = primaries.into();
+        video.color_transfer = transfer.into();
+        video.color_space = matrix.into();
+        filled.push(format!("основные цвета {primaries}, передаточная функция {transfer}, матрица {matrix}"));
+    }
+    if video.color_range != "tv" && video.color_range != "pc" {
+        video.color_range = if video.pix_fmt.starts_with("yuvj") { "pc" } else { "tv" }.into();
+        filled.push(format!("диапазон {}", video.color_range));
+    }
+    filled
+}
+
+// Те же теги в контейнере MKV: часть плееров и медиасерверов берёт цвет оттуда, не разбирая поток.
+fn mkv_colour(video: &Stream) -> Vec<String> {
+    let c = h273(video);
+    let mut m = Vec::new();
+    for (option, value) in [("--colour-primaries", c.primaries), ("--colour-transfer-characteristics", c.transfer), ("--colour-matrix-coefficients", c.matrix)] {
+        if let Some(v) = value {
+            m.extend([option.to_string(), format!("0:{v}")]);
+        }
+    }
+    match video.color_range.as_str() {
+        "tv" => m.extend(["--colour-range".into(), "0:1".into()]),
+        "pc" => m.extend(["--colour-range".into(), "0:2".into()]),
+        _ => {}
+    }
+    // Положение цветности в MKV: по горизонтали 1 — совпадает с левым отсчётом; по вертикали 1 — с верхним, 2 — посередине.
+    match chroma_location(video) {
+        Some("topleft") => m.extend(["--chroma-siting".into(), "0:1,1".into()]),
+        Some("left") => m.extend(["--chroma-siting".into(), "0:1,2".into()]),
+        _ => {}
+    }
+    m
+}
+
+// Положение цветности, которое умеет записать AV1 (left или topleft). Без него плеер считает его
+// left, и на UHD-дисках (topleft) цвет сдвигается на полстроки: цветные каймы на краях.
+fn chroma_location(video: &Stream) -> Option<&'static str> {
+    match video.chroma_location.as_str() {
+        "left" => Some("left"),
+        "topleft" => Some("topleft"),
+        _ => None,
+    }
 }
 
 fn nvenc_args(tools: &Tools, source: &Path, video: &Stream, s: &Settings, fps: f64) -> Res<(Vec<String>, Option<Hdr>)> {
@@ -1259,6 +1460,9 @@ fn nvenc_args(tools: &Tools, source: &Path, video: &Stream, s: &Settings, fps: f
     }
     if video.color_range == "tv" || video.color_range == "pc" {
         nv.extend(["--colorrange".into(), video.color_range.clone()]);
+    }
+    if let Some(loc) = chroma_location(video) {
+        nv.extend(["--chromaloc".into(), loc.into()]);
     }
     if video.color_transfer != "smpte2084" && video.color_transfer != "arib-std-b67" {
         return Ok((nv, None));
@@ -1457,11 +1661,13 @@ mod tests {
             fps_den: 1,
             fps: 24.0,
             seek_offset: 0.0,
+            base: 0,
             enc_args: Vec::new(),
             gpu: false,
             download: String::new(),
             vmaf_scaled: false,
             vmaf_model: "",
+            scale_filter: None,
             threads: 1,
         };
         // Из исходника хватит одной звуковой дорожки, добавленные — все.
@@ -1492,12 +1698,19 @@ mod tests {
         let output = PathBuf::from(std::env::var("AV1_OUT").expect("AV1_OUT"));
         let tools = crate::tools::find_existing().tools().expect("tools");
         let plan = crate::tracks::analyze(&tools, Path::new(&src)).unwrap();
-        let mut settings = Settings { limit: std::env::var("AV1_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(30), ..Settings::default() };
+        let mut settings = Settings {
+            limit: std::env::var("AV1_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(30),
+            start: std::env::var("AV1_START").ok().and_then(|v| crate::util::parse_time(&v)).unwrap_or(0.0),
+            ..Settings::default()
+        };
         if std::env::var("AV1_CODEC").as_deref() == Ok("svt") {
             settings.codec = Codec::Svt;
         }
         if let Some(crf) = std::env::var("AV1_CRF").ok().and_then(|v| v.parse().ok()) {
             settings.svt_max_crf = crf;
+        }
+        if let Some(width) = std::env::var("AV1_WIDTH").ok().and_then(|v| v.parse().ok()) {
+            settings.width = width;
         }
         if let Some(target) = std::env::var("AV1_VMAF").ok().and_then(|v| v.parse().ok()) {
             settings.target_vmaf = target;

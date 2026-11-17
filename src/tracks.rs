@@ -47,6 +47,8 @@ pub struct Stream {
     pub color_transfer: String,
     pub color_space: String,
     pub color_range: String,
+    // Положение отсчётов цветности: у UHD-дисков topleft, у обычных left.
+    pub chroma_location: String,
     pub field_order: String,
     pub tags: Tags,
     pub disposition: HashMap<String, i64>,

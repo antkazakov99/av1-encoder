@@ -89,6 +89,17 @@ pub fn capture(cmd: &Cmd) -> Res<(i32, String, String)> {
     ))
 }
 
+// То же с двоичным выводом: кадр в виде сырых пикселей.
+pub fn capture_bytes(cmd: &Cmd) -> Res<Vec<u8>> {
+    let mut c = cmd.command();
+    c.stdin(Stdio::null());
+    let out = c.output().map_err(|e| format!("Не удалось запустить {}: {e}", cmd.exe.display()))?;
+    if !out.status.success() {
+        return Err(format!("{} завершился с кодом {}: {}", cmd.name(), out.status.code().unwrap_or(-1), last_line(&String::from_utf8_lossy(&out.stderr))));
+    }
+    Ok(out.stdout)
+}
+
 pub fn capture_ok(cmd: &Cmd) -> Res<String> {
     let (code, out, err) = capture(cmd)?;
     if code != 0 {
@@ -248,6 +259,41 @@ pub fn num(v: f64, decimals: usize) -> String {
 pub fn time(seconds: f64) -> String {
     let t = seconds.round_ties_even().max(0.0) as u64;
     format!("{:02}:{:02}:{:02}", t / 3600, t / 60 % 60, t % 60)
+}
+
+// «1:33:20», «93:20» или «5600» (можно с дробью) в секунды.
+pub fn parse_time(text: &str) -> Option<f64> {
+    let parts: Vec<&str> = text.trim().split(':').collect();
+    if parts.is_empty() || parts.len() > 3 {
+        return None;
+    }
+    let mut seconds = 0.0;
+    for (i, p) in parts.iter().enumerate() {
+        let v: f64 = p.trim().replace(',', ".").parse().ok()?;
+        // Минуты и секунды после двоеточия — меньше 60; дробь только у последней части.
+        if v < 0.0 || (i > 0 && v >= 60.0) || (i + 1 < parts.len() && v.fract() != 0.0) {
+            return None;
+        }
+        seconds = seconds * 60.0 + v;
+    }
+    Some(seconds)
+}
+
+#[cfg(test)]
+mod time_tests {
+    use super::parse_time;
+
+    #[test]
+    fn parses() {
+        assert_eq!(parse_time("1:33:20"), Some(5600.0));
+        assert_eq!(parse_time(" 93:20 "), Some(5600.0));
+        assert_eq!(parse_time("5600"), Some(5600.0));
+        assert_eq!(parse_time("0:10,5"), Some(10.5));
+        assert_eq!(parse_time("1:75"), None);
+        assert_eq!(parse_time("abc"), None);
+        assert_eq!(parse_time(""), None);
+        assert_eq!(parse_time("1:2:3:4"), None);
+    }
 }
 
 pub fn size(bytes: f64) -> String {

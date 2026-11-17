@@ -3,6 +3,7 @@
 // и следить за ходом. Внешние программы (ffmpeg, NVEncC, mkvmerge) ищутся автоматически.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod compare;
 mod encode;
 mod theme;
 mod tools;
@@ -41,12 +42,14 @@ struct Saved {
     codec: Codec,
     svt_max_crf: i32,
     svt_preset: i32,
+    // Ширина итога; 0 — исходное разрешение.
+    width: i64,
 }
 
 impl Default for Saved {
     fn default() -> Self {
         let s = Settings::default();
-        Self { target_vmaf: s.target_vmaf, floor_vmaf: s.floor_vmaf, codec: s.codec, svt_max_crf: s.svt_max_crf, svt_preset: s.svt_preset }
+        Self { target_vmaf: s.target_vmaf, floor_vmaf: s.floor_vmaf, codec: s.codec, svt_max_crf: s.svt_max_crf, svt_preset: s.svt_preset, width: s.width }
     }
 }
 
@@ -76,6 +79,10 @@ struct Run {
     state: Arc<Mutex<RunState>>,
     cancel: Arc<AtomicBool>,
     output: PathBuf,
+    // Длительность пробного прогона в секундах; 0 — фильм кодируется целиком.
+    trial: u32,
+    // Начало пробного прогона в секундах.
+    trial_start: f64,
 }
 
 struct App {
@@ -94,8 +101,12 @@ struct App {
     output: String,
     test_run: bool,
     test_seconds: u32,
+    // Откуда начинать пробный прогон: «чч:мм:сс», «мм:сс» или секунды; пусто — с середины фильма.
+    test_start: String,
     error: String,
     run: Option<Run>,
+    // Открытый экран сравнения итога с исходником.
+    compare: Option<compare::Compare>,
     confirm_close: bool,
 }
 
@@ -116,8 +127,10 @@ impl App {
             output: String::new(),
             test_run: false,
             test_seconds: 120,
+            test_start: String::new(),
             error: String::new(),
             run: None,
+            compare: None,
             confirm_close: false,
         };
         app.setup(false);
@@ -249,27 +262,54 @@ impl App {
             self.error = "Не указан итоговый файл.".into();
             return;
         }
+        // Начало пробы: пусто — середина фильма; проба не выходит за конец фильма.
+        let mut start = 0.0;
+        if self.test_run {
+            let duration = util::rational(&plan.probe.format.duration);
+            let seconds = self.test_seconds as f64;
+            start = if self.test_start.trim().is_empty() {
+                (duration / 2.0 - seconds / 2.0).floor()
+            } else {
+                match util::parse_time(&self.test_start) {
+                    Some(t) => t,
+                    None => {
+                        self.error = format!("Начало пробы «{}» не понято: нужно чч:мм:сс, мм:сс или секунды.", self.test_start.trim());
+                        return;
+                    }
+                }
+            };
+            start = start.min((duration - seconds).floor()).max(0.0);
+        }
+        // Поле «Итоговый файл» — всегда настоящий итог; проба идёт во временную папку под тем же именем.
+        let output = if self.test_run {
+            match trial_output(&output) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.error = e;
+                    return;
+                }
+            }
+        } else {
+            output
+        };
         let settings = Settings {
+            start,
             target_vmaf: self.saved.target_vmaf,
             floor_vmaf: self.saved.floor_vmaf,
             codec: self.saved.codec,
             svt_max_crf: self.saved.svt_max_crf,
             svt_preset: self.saved.svt_preset,
+            width: self.saved.width,
             limit: if self.test_run { self.test_seconds } else { 0 },
             ..Settings::default()
         };
         self.saved.save();
         let state = Arc::new(Mutex::new(RunState::default()));
         let cancel = Arc::new(AtomicBool::new(false));
+        let trial = settings.limit;
         encode::start(encode::Job { plan, title, output: output.clone(), settings }, tools, state.clone(), cancel.clone());
         self.error.clear();
-        self.run = Some(Run { state, cancel, output });
-    }
-
-    // Имя итогового файла по названию.
-    fn suggested_output(&self) -> Option<String> {
-        let plan = self.plan.as_ref()?;
-        suggested(&plan.output, &self.title, self.test_run)
+        self.run = Some(Run { state, cancel, output, trial, trial_start: start });
     }
 
     // Узкая строка вверху: состояние ffmpeg, NVEncC и mkvmerge.
@@ -327,6 +367,14 @@ impl App {
     fn actions_bar(&mut self, ui: &mut egui::Ui, running: bool) {
         let side_button = |text: &str| egui::Button::new(text.to_string()).min_size(egui::vec2(150.0, 36.0)).corner_radius(egui::CornerRadius::same(8));
         ui.horizontal(|ui| {
+            if self.compare.is_some() {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(side_button("←  К журналу")).clicked() {
+                        self.compare = None;
+                    }
+                });
+                return;
+            }
             if self.run.is_some() {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if running {
@@ -339,6 +387,7 @@ impl App {
                         ui.label(theme::weak(ui, "Готовые куски сохраняются: следующий запуск продолжит с них.").small());
                     } else if ui.add(side_button("←  К дорожкам")).clicked() {
                         self.run = None;
+                        self.compare = None;
                     }
                 });
                 return;
@@ -384,14 +433,14 @@ impl App {
             ui.add_space(6.0);
             ui.separator();
             ui.add_space(6.0);
-            let before = self.suggested_output();
-            ui.checkbox(&mut self.test_run, "Пробный прогон").on_hover_text("Кодируется только начало фильма, в отдельный файл");
+            ui.checkbox(&mut self.test_run, "Пробный прогон")
+                .on_hover_text("Кодируется только отрезок фильма — во временную папку, а не рядом с итогом.\nПробы других фильмов оттуда удаляются при следующей пробе.");
             ui.add_enabled(self.test_run, egui::DragValue::new(&mut self.test_seconds).range(10..=3600).suffix(" с"));
-            if before.as_deref() == Some(self.output.as_str()) {
-                if let Some(next) = self.suggested_output() {
-                    self.output = next;
-                }
-            }
+            ui.add_enabled_ui(self.test_run, |ui| {
+                ui.label(theme::weak(ui, "с"));
+                ui.add(egui::TextEdit::singleline(&mut self.test_start).hint_text("середины").desired_width(76.0))
+                    .on_hover_text("Откуда начать пробу: 1:33:20, 93:20 или 5600.\nПусто — с середины фильма: в начале обычно титры.");
+            });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let ready = self.plan.is_some() && self.loading.is_none() && self.tools().is_some();
                 if theme::primary_button(ui, ready, "Кодировать").clicked() {
@@ -431,12 +480,12 @@ impl App {
                     let Some(plan) = &mut self.plan else { return };
 
                     ui.label(theme::weak(ui, "Название"));
-                    let before = suggested(&plan.output, &self.title, self.test_run);
+                    let before = suggested(&plan.output, &self.title);
                     let width = ui.available_width().min(460.0);
                     ui.add_sized([width, FIELD_HEIGHT], text_field(&mut self.title).hint_text("Название (год)"));
                     // Имя итогового файла следует за названием, пока его не правили вручную.
                     if before.as_deref() == Some(self.output.as_str()) {
-                        if let Some(next) = suggested(&plan.output, &self.title, self.test_run) {
+                        if let Some(next) = suggested(&plan.output, &self.title) {
                             self.output = next;
                         }
                     }
@@ -461,6 +510,29 @@ impl App {
                         }
                     });
                     ui.end_row();
+
+                    // Разрешение итога: исходное или меньше (по ширине, высота по пропорции).
+                    if let Some(video) = plan.probe.streams.iter().find(|s| s.codec_type == "video" && !s.flag("attached_pic")) {
+                        let (w, h) = (video.width, video.height);
+                        let sizes: Vec<(i64, &str)> = [(2560, "1440p"), (1920, "1080p"), (1280, "720p")].into_iter().filter(|(x, _)| *x < w).collect();
+                        if !sizes.is_empty() && w > 0 {
+                            ui.label(theme::weak(ui, "Разрешение"));
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                let current = if self.saved.width > 0 && self.saved.width < w { self.saved.width } else { 0 };
+                                if theme::chip(ui, current == 0, &format!("Исходное {w}×{h}")).clicked() {
+                                    self.saved.width = 0;
+                                }
+                                for (x, name) in sizes {
+                                    let y = ((h as f64 * x as f64 / w as f64 / 2.0).round_ties_even() as i64 * 2).max(2);
+                                    if theme::chip(ui, current == x, &format!("{name} {x}×{y}")).on_hover_text("Кадр уменьшается перед кодированием (Lanczos); VMAF считается в этом же размере").clicked() {
+                                        self.saved.width = x;
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    }
 
                     ui.label(theme::weak(ui, "Язык оригинала"));
                     ui.horizontal(|ui| {
@@ -524,6 +596,7 @@ impl App {
     // Экран кодирования: этап, ход, журнал.
     fn run_view(&mut self, ui: &mut egui::Ui) {
         let p = theme::palette(ui);
+        let mut open_compare = false;
         let Some(run) = &self.run else { return };
         let st = run.state.lock().unwrap();
         ui.spacing_mut().item_spacing.y = 12.0;
@@ -539,6 +612,9 @@ impl App {
                         ui.label(RichText::new(run.output.display().to_string()).color(p.good));
                         if ui.button("Показать в папке").clicked() {
                             show_in_folder(&run.output);
+                        }
+                        if ui.button("Сравнить с исходником").on_hover_text("Один и тот же кадр из исходника и итога: переключение, шторка, масштаб").clicked() {
+                            open_compare = true;
                         }
                     });
                 }
@@ -580,6 +656,12 @@ impl App {
                 }
             });
         });
+        drop(st);
+        if open_compare {
+            if let Some(plan) = &self.plan {
+                self.compare = compare::Compare::new(plan, &run.output, run.trial, run.trial_start);
+            }
+        }
     }
 }
 
@@ -636,6 +718,14 @@ impl eframe::App for App {
         egui::Panel::bottom("actions").frame(bar(p.card, 12)).show(ui, |ui| self.actions_bar(ui, running));
         let margin = egui::Margin { left: 16, right: 16, top: 2, bottom: 14 };
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.background).inner_margin(margin)).show(ui, |ui| {
+            // Сравнение кадров занимает всю ширину окна.
+            if self.compare.is_some() {
+                let tools = self.tools();
+                if let Some(compare) = &mut self.compare {
+                    compare.ui(ui, tools.as_ref());
+                }
+                return;
+            }
             // В широком окне содержимое не растягивается на всю ширину, а стоит по центру.
             let available = ui.available_rect_before_wrap();
             let rect = egui::Rect::from_center_size(available.center(), egui::vec2(available.width().min(CONTENT_WIDTH), available.height()));
@@ -939,11 +1029,60 @@ fn track_table(ui: &mut egui::Ui, tracks: &mut Vec<Track>, kind: Kind, heading: 
 }
 
 // Название меняет имя итогового файла, пока его не правили вручную.
-fn suggested(output: &Path, title: &str, test_run: bool) -> Option<String> {
+fn suggested(output: &Path, title: &str) -> Option<String> {
     let dir = output.parent()?;
     let name = tracks::file_name(title);
-    let suffix = if test_run { ".sample.mkv" } else { ".mkv" };
-    Some(dir.join(format!("{name}{suffix}")).display().to_string())
+    Some(dir.join(format!("{name}.mkv")).display().to_string())
+}
+
+// Пробные прогоны — временные файлы: %TEMP%\av1-gui\trials, а не папка с фильмами.
+fn trial_dir() -> PathBuf {
+    std::env::temp_dir().join("av1-gui").join("trials")
+}
+
+// Путь пробы для итогового файла. Пробы других фильмов (и их рабочие папки) удаляются;
+// проба этого фильма остаётся: повторный запуск продолжит её с готовых кусков.
+fn trial_output(output: &Path) -> util::Res<PathBuf> {
+    trial_output_in(&trial_dir(), output)
+}
+
+fn trial_output_in(dir: &Path, output: &Path) -> util::Res<PathBuf> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("Не удалось создать {}: {e}", dir.display()))?;
+    let stem = output.file_stem().unwrap_or_default().to_string_lossy().to_string();
+    let name = format!("{stem}.sample.mkv");
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&name) {
+                continue;
+            }
+            // Занятые (открытые в плеере) файлы остаются до следующего раза.
+            let path = entry.path();
+            let _ = if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+        }
+    }
+    Ok(dir.join(name))
+}
+
+#[cfg(test)]
+mod trial_tests {
+    use super::trial_output_in;
+
+    #[test]
+    fn keeps_only_this_film() {
+        let dir = std::env::temp_dir().join(format!("av1-gui-trial-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Other (2000).sample.mkv.work").join("chunks")).unwrap();
+        std::fs::create_dir_all(dir.join("Film (2012).sample.mkv.work")).unwrap();
+        for f in ["Other (2000).sample.mkv", "Film (2012).sample.mkv"] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        let out = trial_output_in(&dir, std::path::Path::new(r"D:\Movies\Film (2012).mkv")).unwrap();
+        assert_eq!(out, dir.join("Film (2012).sample.mkv"));
+        let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().to_string()).collect();
+        left.sort();
+        assert_eq!(left, ["Film (2012).sample.mkv", "Film (2012).sample.mkv.work"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 fn main() -> eframe::Result {
